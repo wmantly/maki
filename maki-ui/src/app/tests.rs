@@ -3956,7 +3956,7 @@ fn remote_plan_action_implement_uses_the_remote_parallel_flag_not_the_local_widg
         actions
             .iter()
             .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg)),
-        "{actions:?}"
+        "expected a SendMessage action with the parallel hint"
     );
     assert_eq!(app.state.plan, PlanState::None);
 }
@@ -3973,17 +3973,24 @@ fn remote_plan_action_clears_readiness_and_returns_to_build(action: &str) {
 
 #[test]
 fn remote_plan_action_rejects_when_no_plan_is_ready() {
+    // Not assert_eq!/unwrap_err(): Action (inside the Ok(Vec<Action>) side)
+    // implements neither Debug nor PartialEq, matching this file's existing
+    // convention of pattern-matching Action values instead of comparing
+    // them directly.
     let mut app = test_app();
-    assert_eq!(
-        app.remote_plan_action("implement", false),
-        Err("no plan is ready".to_owned())
-    );
+    match app.remote_plan_action("implement", false) {
+        Err(msg) => assert_eq!(msg, "no plan is ready"),
+        Ok(_) => panic!("expected an error: no plan is ready"),
+    }
 }
 
 #[test]
 fn remote_plan_action_rejects_an_unknown_action() {
     let mut app = plan_app();
-    let err = app.remote_plan_action("bogus", false).unwrap_err();
+    let err = match app.remote_plan_action("bogus", false) {
+        Err(msg) => msg,
+        Ok(_) => panic!("expected an error for an unknown action"),
+    };
     assert!(err.contains("bogus"), "{err}");
     // Rejected outright: state is untouched, unlike a real action.
     assert!(app.plan_form.is_visible());

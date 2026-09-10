@@ -567,12 +567,10 @@ impl Dispatcher {
             | Route::WindowInput
             | Route::Stop
             | Route::Command
-            | Route::PlanAction => {
-                match self.dispatch_post(route, session, body) {
-                    Ok(()) => DispatchOutcome::Posted(200, None),
-                    Err(reason) => DispatchOutcome::Posted(400, Some(reason)),
-                }
-            }
+            | Route::PlanAction => match self.dispatch_post(route, session, body) {
+                Ok(()) => DispatchOutcome::Posted(200, None),
+                Err(reason) => DispatchOutcome::Posted(400, Some(reason)),
+            },
             Route::Highlight => {
                 let parsed: serde_json::Value = match serde_json::from_str(body) {
                     Ok(v) => v,
