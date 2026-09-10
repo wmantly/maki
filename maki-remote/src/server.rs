@@ -179,6 +179,16 @@ pub enum RemoteRequest {
         code: String,
         reply: Sender<serde_json::Value>,
     },
+    /// Acts on the plan-complete card: `action` is `"refine"`,
+    /// `"clear_and_implement"`, or `"implement"`, matching
+    /// `PlanFormAction`'s three menu entries. `parallel` is the browser's
+    /// own toggle, independent of the TUI widget's local one.
+    PlanAction {
+        session: Option<String>,
+        action: String,
+        parallel: bool,
+        reply: Sender<Result<(), String>>,
+    },
 }
 
 impl RemoteRequest {
@@ -204,7 +214,8 @@ impl RemoteRequest {
             | Self::FilesFlat { session, .. }
             | Self::FileCreate { session, .. }
             | Self::FileDelete { session, .. }
-            | Self::FileRename { session, .. } => session.as_deref(),
+            | Self::FileRename { session, .. }
+            | Self::PlanAction { session, .. } => session.as_deref(),
             Self::Sessions { .. } | Self::Highlight { .. } => None,
         }
     }

@@ -281,6 +281,12 @@ pub struct App {
     pub(super) pack_review: PackReview,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
+    /// The plan path last mirrored to the remote (`None` if it was never
+    /// ready, or the last mirror was a clear). `take_plan_change` diffs
+    /// against this each tick, so any code path that changes
+    /// `state.plan`'s readiness -- implement, refine, a session reset --
+    /// is caught without having to remember to flag it there too.
+    plan_remote_last: Option<PathBuf>,
     pub(super) status_bar: StatusBar,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
@@ -382,6 +388,7 @@ impl App {
             pack_review: PackReview::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
+            plan_remote_last: None,
             status_bar: StatusBar::new(flash),
             status: Status::Idle,
             state,
@@ -925,6 +932,7 @@ impl App {
             // connected, with no live window_open frame left to catch.
             "window": self.remote_focused_window_snapshot(),
             "panels": self.remote_panel_snapshots(),
+            "plan": self.remote_plan_snapshot(),
         })
     }
 
@@ -2201,13 +2209,74 @@ impl App {
                     vec![]
                 }
             },
-            PlanFormAction::Implement => self.implement_plan(false),
-            PlanFormAction::ClearAndImplement => self.implement_plan(true),
+            PlanFormAction::Implement => self.implement_plan(false, self.plan_form.parallel()),
+            PlanFormAction::ClearAndImplement => {
+                self.implement_plan(true, self.plan_form.parallel())
+            }
         }
     }
 
-    fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
-        let parallel = self.plan_form.parallel();
+    /// Acts on the remote's plan-complete card the same way the equivalent
+    /// local key would. `parallel` is the browser's own toggle -- unlike a
+    /// local Enter, which reads `self.plan_form.parallel()`, a remote action
+    /// has no local widget state to read, so the caller passes what the web
+    /// UI's checkbox was set to.
+    pub(crate) fn remote_plan_action(
+        &mut self,
+        action: &str,
+        parallel: bool,
+    ) -> Result<Vec<Action>, String> {
+        if !self.state.plan.is_ready() {
+            return Err("no plan is ready".to_owned());
+        }
+        match action {
+            "refine" => {
+                self.plan_form.hide();
+                Ok(vec![])
+            }
+            "implement" => Ok(self.implement_plan(false, parallel)),
+            "clear_and_implement" => Ok(self.implement_plan(true, parallel)),
+            other => Err(format!("unknown plan action: {other}")),
+        }
+    }
+
+    /// The plan-complete card's current state, for a fresh remote snapshot
+    /// (a reconnect must see an already-ready plan, not just future `plan`/
+    /// `plan_cleared` SSE frames -- same reconnect gap
+    /// `remote_focused_window_snapshot` exists to close for windows).
+    pub(crate) fn remote_plan_snapshot(&self) -> Option<serde_json::Value> {
+        self.state
+            .plan
+            .is_ready()
+            .then(|| self.state.plan.path())
+            .flatten()
+            .map(|p| serde_json::json!({ "path": p.display().to_string() }))
+    }
+
+    /// Diffs the plan's readiness against what was last mirrored to the
+    /// remote, for the event loop to poll every tick. `Some(Some(path))` is
+    /// a plan that just became ready; `Some(None)` is one that just stopped
+    /// being ready (refined, implemented, or the session reset); `None` is
+    /// no change since the last poll. A diff against remembered state,
+    /// rather than flagging every call site that can change `state.plan`,
+    /// so nothing new added later can be missed the way this mirror itself
+    /// was the first time around.
+    pub(crate) fn take_plan_change(&mut self) -> Option<Option<PathBuf>> {
+        let current = self
+            .state
+            .plan
+            .is_ready()
+            .then(|| self.state.plan.path())
+            .flatten()
+            .map(|p| p.to_path_buf());
+        if current == self.plan_remote_last {
+            return None;
+        }
+        self.plan_remote_last = current.clone();
+        Some(current)
+    }
+
+    fn implement_plan(&mut self, clear_context: bool, parallel: bool) -> Vec<Action> {
         self.plan_form.reset();
         let plan_snapshot = match std::mem::take(&mut self.state.plan) {
             PlanState::Ready(p) => Some((

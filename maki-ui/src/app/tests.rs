@@ -3929,6 +3929,101 @@ fn ctrl_t_noop_when_plan_not_ready() {
     assert!(!app.plan_form.is_visible());
 }
 
+#[test]
+fn remote_plan_action_refine_hides_the_form_but_keeps_the_plan_ready() {
+    // Mirrors local Esc/Ctrl+T: dismiss the popup, not the underlying
+    // readiness -- a remote viewer dismissing their own card must not yank
+    // it out from under a local user still looking at it, and vice versa.
+    let mut app = plan_app();
+    assert!(app.plan_form.is_visible());
+
+    let actions = app.remote_plan_action("refine", false).unwrap();
+    assert!(actions.is_empty());
+    assert!(!app.plan_form.is_visible());
+    assert!(app.state.plan.is_ready());
+}
+
+#[test]
+fn remote_plan_action_implement_uses_the_remote_parallel_flag_not_the_local_widget() {
+    // The local widget's own toggle defaults to false and is never touched
+    // here -- the browser's checkbox is a separate, independent flag.
+    let mut app = plan_app();
+    assert!(!app.plan_form.parallel());
+
+    let actions = app.remote_plan_action("implement", true).unwrap();
+    let expected_msg = implement_msg(true);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg)),
+        "{actions:?}"
+    );
+    assert_eq!(app.state.plan, PlanState::None);
+}
+
+#[test_case("implement" ; "implement")]
+#[test_case("clear_and_implement" ; "clear_and_implement")]
+fn remote_plan_action_clears_readiness_and_returns_to_build(action: &str) {
+    let mut app = plan_app();
+    app.remote_plan_action(action, false).unwrap();
+    assert_eq!(app.state.mode, Mode::Build);
+    assert_eq!(app.state.plan, PlanState::None);
+    assert!(!app.plan_form.is_visible());
+}
+
+#[test]
+fn remote_plan_action_rejects_when_no_plan_is_ready() {
+    let mut app = test_app();
+    assert_eq!(
+        app.remote_plan_action("implement", false),
+        Err("no plan is ready".to_owned())
+    );
+}
+
+#[test]
+fn remote_plan_action_rejects_an_unknown_action() {
+    let mut app = plan_app();
+    let err = app.remote_plan_action("bogus", false).unwrap_err();
+    assert!(err.contains("bogus"), "{err}");
+    // Rejected outright: state is untouched, unlike a real action.
+    assert!(app.plan_form.is_visible());
+    assert!(app.state.plan.is_ready());
+}
+
+#[test]
+fn remote_plan_snapshot_reflects_readiness() {
+    let mut app = test_app();
+    assert_eq!(app.remote_plan_snapshot(), None);
+
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
+    assert_eq!(app.remote_plan_snapshot(), None, "drafting is not ready");
+
+    let app = plan_app();
+    assert_eq!(
+        app.remote_plan_snapshot(),
+        Some(serde_json::json!({ "path": "test-plan.md" }))
+    );
+}
+
+#[test]
+fn take_plan_change_diffs_against_the_last_poll_instead_of_firing_every_tick() {
+    let mut app = plan_app();
+    // Already ready by construction (plan_app runs the write-done event
+    // before returning) -- the first poll ever must still report it, since
+    // nothing has been mirrored out yet.
+    assert_eq!(
+        app.take_plan_change(),
+        Some(Some(PathBuf::from("test-plan.md")))
+    );
+    // Nothing changed since that poll.
+    assert_eq!(app.take_plan_change(), None);
+
+    app.remote_plan_action("implement", false).unwrap();
+    assert_eq!(app.take_plan_change(), Some(None), "no longer ready");
+    assert_eq!(app.take_plan_change(), None, "still nothing new to report");
+}
+
 fn install_override(
     app: &mut App,
     key: KeyCode,

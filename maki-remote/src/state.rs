@@ -43,6 +43,18 @@ pub enum RemoteUpdate {
         session: String,
         id: u32,
     },
+    /// A Plan Mode plan just became ready for review (the agent finished
+    /// writing it) — the remote counterpart of `PlanForm::on_plan_ready()`.
+    Plan {
+        session: String,
+        frame: PlanFrame,
+    },
+    /// The ready plan stopped being ready: refined back into drafting,
+    /// implemented, or the session reset. No remote client should keep
+    /// showing the plan-complete card.
+    PlanCleared {
+        session: String,
+    },
     Shutdown,
 }
 
@@ -56,7 +68,9 @@ impl RemoteUpdate {
             | Self::PermissionResolved { session, .. }
             | Self::WindowOpen { session, .. }
             | Self::WindowUpdate { session, .. }
-            | Self::WindowClose { session, .. } => Some(session),
+            | Self::WindowClose { session, .. }
+            | Self::Plan { session, .. }
+            | Self::PlanCleared { session, .. } => Some(session),
             Self::Shutdown => None,
         }
     }
@@ -68,6 +82,15 @@ pub struct PermissionFrame {
     pub id: String,
     pub tool: String,
     pub scopes: Vec<String>,
+}
+
+/// What a remote client needs to render the plan-complete card. `path` is
+/// the plan file's path, the same thing `PlanFormAction::OpenEditor` opens
+/// locally — the plan's own content is fetched separately via the existing
+/// file-read route, not duplicated here.
+#[derive(Debug, Clone)]
+pub struct PlanFrame {
+    pub path: String,
 }
 
 /// A live SSE subscriber. Unregisters from the fan-out when dropped, so every
@@ -250,6 +273,19 @@ impl RemoteState {
             id,
         });
     }
+
+    pub fn send_plan(&self, session_id: &str, frame: PlanFrame) {
+        self.publish(RemoteUpdate::Plan {
+            session: session_id.to_owned(),
+            frame,
+        });
+    }
+
+    pub fn send_plan_cleared(&self, session_id: &str) {
+        self.publish(RemoteUpdate::PlanCleared {
+            session: session_id.to_owned(),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -332,5 +368,27 @@ mod tests {
 
         state.send_status(SESSION, STATUS_IDLE);
         assert!(b.updates.try_recv().is_ok());
+    }
+
+    #[test]
+    fn plan_ready_and_cleared_reach_a_subscriber() {
+        let state = RemoteState::new();
+        let sub = state.subscribe(None, "t·view".into());
+        state.send_plan(
+            SESSION,
+            PlanFrame {
+                path: "plans/plan.md".into(),
+            },
+        );
+        assert!(matches!(
+            sub.updates.try_recv(),
+            Ok(RemoteUpdate::Plan { session, frame })
+                if session == SESSION && frame.path == "plans/plan.md"
+        ));
+        state.send_plan_cleared(SESSION);
+        assert!(matches!(
+            sub.updates.try_recv(),
+            Ok(RemoteUpdate::PlanCleared { session }) if session == SESSION
+        ));
     }
 }

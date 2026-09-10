@@ -157,6 +157,17 @@
     font: inherit;
     display: none;
   }
+  #plan-card {
+    display: none;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: var(--panel);
+    padding: 10px 14px;
+    margin: 8px 14px;
+  }
+  #plan-card .planpath { color: var(--accent); }
+  #plan-card .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+  #plan-card label { display: flex; align-items: center; gap: 4px; color: var(--muted); }
   button {
     background: var(--bg);
     color: var(--text);
@@ -775,6 +786,15 @@
   </div>
   <textarea id="deny-guidance" placeholder="Guidance for the agent (optional; submit with the deny button)"></textarea>
 </div>
+<div id="plan-card">
+  <div>Plan ready: <span class="planpath" id="plan-path"></span></div>
+  <div class="row">
+    <button data-plan="refine">Refine plan</button>
+    <button class="primary" data-plan="implement">Implement plan</button>
+    <button data-plan="clear_and_implement">Clear context &amp; implement</button>
+    <label><input type="checkbox" id="plan-parallel"> parallel</label>
+  </div>
+</div>
 <div id="stoprow"><button class="danger" id="stop">Stop run (Esc)</button></div>
 <div id="chips"></div>
 <div id="inputrow">
@@ -793,6 +813,9 @@
   const cwdEl = document.getElementById("cwd");
   const modelEl = document.getElementById("model");
   const permEl = document.getElementById("perm");
+  const planCardEl = document.getElementById("plan-card");
+  const planPathEl = document.getElementById("plan-path");
+  const planParallelCheck = document.getElementById("plan-parallel");
   const promptEl = document.getElementById("prompt");
   // Grows the box with its content up to the CSS max-height (which then
   // scrolls internally), and snaps back down once it's cleared — matching
@@ -808,7 +831,7 @@
   // safe-area inset, the auto-growing textarea, the stop button and an open
   // permission card all move that edge — so measure the whole stack below
   // <main> and publish it for the CSS to position off.
-  const bottomBars = ["perm", "stoprow", "chips", "inputrow"].map((id) => document.getElementById(id));
+  const bottomBars = ["perm", "plan-card", "stoprow", "chips", "inputrow"].map((id) => document.getElementById(id));
   const syncComposerHeight = () => {
     for (const el of bottomBars) {
       const r = el.getBoundingClientRect();
@@ -1618,6 +1641,18 @@
         }
         break;
       }
+      case "plan_ready": {
+        planPathEl.textContent = event.path;
+        planCardEl.style.display = "block";
+        syncComposerHeight();
+        notify("maki — plan ready", event.path ? `ready for review: ${event.path}` : "ready for review");
+        break;
+      }
+      case "plan_cleared": {
+        planCardEl.style.display = "none";
+        syncComposerHeight();
+        break;
+      }
       case "user_message": renderUserMessage(event); break;
       case "assistant_text": {
         const node = el("msg assistant", "");
@@ -1674,6 +1709,11 @@
     if (snap.pending_permission) {
       renderEvent({ type: "permission_request", id: snap.pending_permission.id, tool: "resuming" });
     }
+    // Same reconnect gap as the pending permission above: a plan that
+    // became ready before this tab connected needs the snapshot to carry
+    // it, since plan/plan_cleared only fire on the next change.
+    if (snap.plan) renderEvent({ type: "plan_ready", path: snap.plan.path });
+    else renderEvent({ type: "plan_cleared" });
     replaying = false;
     setHeader(snap);
     // A reconnect (phone screen waking up, a hard refresh) needs to see an
@@ -1723,7 +1763,7 @@
       // on reconnect restores the chat without a hard refresh.
       setTimeout(() => { connect(); refreshSnapshot(); }, 2000);
     };
-    for (const kind of ["snapshot", "event", "status", "permission", "permission_resolved", "window_open", "window_update", "window_close"]) {
+    for (const kind of ["snapshot", "event", "status", "permission", "permission_resolved", "window_open", "window_update", "window_close", "plan", "plan_cleared"]) {
       es.addEventListener(kind, (ev) => {
         try {
           const data = JSON.parse(ev.data);
@@ -1734,6 +1774,8 @@
           else if (kind === "permission_resolved") renderEvent({ type: "permission_resolved", ...data });
           else if (kind === "window_open" || kind === "window_update") renderWindow(data);
           else if (kind === "window_close") closeWindow(data.id);
+          else if (kind === "plan") renderEvent({ type: "plan_ready", ...data });
+          else if (kind === "plan_cleared") renderEvent({ type: "plan_cleared" });
         } catch {}
       });
     }
@@ -2880,6 +2922,19 @@
       if (!denyGuidance.value.trim()) return;
     }
     answerPermission(answer);
+  });
+  planCardEl.addEventListener("click", (ev) => {
+    const action = ev.target?.dataset?.plan;
+    if (!action) return;
+    submit("plan", { action, parallel: planParallelCheck.checked });
+    // "refine" only dismisses the card, the same as local Esc/Ctrl+T -- it
+    // does not clear the plan's readiness (see remote_plan_action), so no
+    // plan_cleared frame is coming to hide this reactively the way
+    // implement/clear_and_implement's really-cleared state does.
+    if (action === "refine") {
+      planCardEl.style.display = "none";
+      syncComposerHeight();
+    }
   });
 
   connect();

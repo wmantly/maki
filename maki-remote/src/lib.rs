@@ -12,7 +12,7 @@ pub mod tunnel;
 
 pub use dispatch::Route;
 pub use server::{RemoteFile, RemoteRequest, RemoteServer, UploadMode};
-pub use state::{PermissionFrame, RemoteState, RemoteUpdate};
+pub use state::{PermissionFrame, PlanFrame, RemoteState, RemoteUpdate};
 pub use tunnel::{TunnelClient, TunnelReport, run_tunnel};
 
 use thiserror::Error;

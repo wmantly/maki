@@ -649,6 +649,16 @@ fn handle_request(
             let _ = reply.send(app.remote_file_rename(&from, &to));
             Ok(vec![])
         }
+        RemoteRequest::PlanAction {
+            action,
+            parallel,
+            reply,
+            ..
+        } => {
+            let outcome = app.remote_plan_action(&action, parallel);
+            let _ = reply.send(outcome.as_ref().map(|_| ()).map_err(Clone::clone));
+            outcome
+        }
     };
     outcome.unwrap_or_default()
 }
@@ -659,7 +669,8 @@ fn reject(request: RemoteRequest, reason: &str) {
         | RemoteRequest::Answer { reply, .. }
         | RemoteRequest::WindowInput { reply, .. }
         | RemoteRequest::Stop { reply, .. }
-        | RemoteRequest::Command { reply, .. } => {
+        | RemoteRequest::Command { reply, .. }
+        | RemoteRequest::PlanAction { reply, .. } => {
             let _ = reply.send(Err(reason.to_owned()));
         }
         RemoteRequest::ModelSet { reply, .. } => {
@@ -1016,6 +1027,24 @@ mod tests {
             &serde_json::json!({}),
         );
         assert_eq!(rx.recv().unwrap().unwrap_err(), "no run is active");
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn handle_request_routes_plan_action_through_to_the_app_and_reports_its_error() {
+        let mut app = crate::app::tests::test_app();
+        let (tx, rx) = flume::unbounded();
+        let actions = handle_request(
+            &mut app,
+            RemoteRequest::PlanAction {
+                session: None,
+                action: "implement".into(),
+                parallel: false,
+                reply: tx,
+            },
+            &serde_json::json!({}),
+        );
+        assert_eq!(rx.recv().unwrap().unwrap_err(), "no plan is ready");
         assert!(actions.is_empty());
     }
 
