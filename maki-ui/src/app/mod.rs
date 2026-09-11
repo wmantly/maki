@@ -356,6 +356,8 @@ impl App {
         );
         let mut app = Self {
             chats: vec![Chat::new(
+                state.session.id,
+                None,
                 "Main".into(),
                 ui_config.clone(),
                 lua_event_handle.clone(),
@@ -1251,6 +1253,17 @@ impl App {
             return actions;
         }
 
+        if key::SCROLL_PAGE_UP.matches(key) {
+            let page = self.chats[self.active_chat].page();
+            self.active_chat().scroll(page);
+            return vec![];
+        }
+        if key::SCROLL_PAGE_DOWN.matches(key) {
+            let page = self.chats[self.active_chat].page();
+            self.active_chat().scroll(-page);
+            return vec![];
+        }
+
         if !self.is_main_chat() {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
@@ -1680,8 +1693,9 @@ impl App {
         if let Some(ref model) = subagent.model {
             self.chats[0].update_tool_model(id, model);
         }
-        let mut chat = Chat::subagent(
-            id,
+        let mut chat = Chat::new(
+            self.state.session.id,
+            Some(id),
             subagent.name.clone(),
             self.ui_config.clone(),
             self.lua_event_handle.clone(),

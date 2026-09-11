@@ -477,6 +477,21 @@ pub fn warm_catalog() {
     init_shared_catalog_if_needed();
 }
 
+/// Force-refetches the models.dev catalog; failures keep the stale catalog and cache.
+/// Blocks, so only call it from startup paths, never from inside the executor.
+pub fn refresh_catalog() -> Result<(), AgentError> {
+    let state_dir = StateDir::resolve()
+        .map_err(|e| config_error(format!("failed to resolve state dir: {e}")))?;
+    let data = fetch_catalog_blocking(&state_dir)?;
+    match SHARED_CATALOG.get() {
+        Some(catalog) => *catalog.lock().unwrap() = data,
+        // Set instead of `get_or_init` so a cold catalog takes the fetch we just
+        // did rather than kicking off `init_catalog_blocking` and fetching twice.
+        None => drop(SHARED_CATALOG.set(Mutex::new(data))),
+    }
+    Ok(())
+}
+
 /// Returns the list of all providers in alphabetical order.
 pub fn catalog_providers() -> Vec<ProviderData> {
     let guard = init_shared_catalog_if_needed().lock().unwrap();
@@ -617,6 +632,22 @@ fn determine_catalog_format(npm: &str) -> EndpointType {
     }
 }
 
+fn catalog_client() -> HttpClient {
+    isahc::HttpClient::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .low_speed_timeout(1, Duration::from_secs(30))
+        // curl carries http2 for OTLP.
+        .version_negotiation(VersionNegotiation::http11())
+        .build()
+        .expect("failed to build catalog HTTP client")
+}
+
+fn fetch_catalog_blocking(state_dir: &StateDir) -> Result<CatalogData, AgentError> {
+    let index = smol::block_on(fetch_remote_catalog_async(&catalog_client()))?;
+    smol::block_on(save_cached_catalog_async(&index));
+    Ok(CatalogData::from_index(index, state_dir))
+}
+
 // Try cache first, then fetch from remote.
 fn init_catalog_blocking() -> CatalogData {
     let state_dir = match StateDir::resolve() {
@@ -631,19 +662,8 @@ fn init_catalog_blocking() -> CatalogData {
         return CatalogData::from_index(index, &state_dir);
     }
 
-    let client = isahc::HttpClient::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .low_speed_timeout(1, Duration::from_secs(30))
-        // curl carries http2 for OTLP.
-        .version_negotiation(VersionNegotiation::http11())
-        .build()
-        .expect("failed to build catalog HTTP client");
-
-    match smol::block_on(fetch_remote_catalog_async(&client)) {
-        Ok(index) => {
-            smol::block_on(save_cached_catalog_async(&index));
-            CatalogData::from_index(index, &state_dir)
-        }
+    match fetch_catalog_blocking(&state_dir) {
+        Ok(data) => data,
         Err(e) => {
             warn!(error = %e, "catalog fetch failed, using empty catalog");
             CatalogData::empty(state_dir)
@@ -994,7 +1014,7 @@ mod tests {
         Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, ProviderQuirks,
         SessionRef, StateDir, available_if_warm, determine_catalog_format, quirks_for,
     };
-    use crate::model::{Model, ModelPricing};
+    use crate::model::{Model, ModelInfo, ModelPricing};
     use crate::provider::Provider;
     use crate::providers::{ResolvedAuth, Timeouts, opencode};
     use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
@@ -1581,6 +1601,84 @@ mod tests {
 
         let model = super::Model::from_spec(&format!("opencode/{model_id}")).unwrap();
         assert_eq!(model.is_free(), expected);
+    }
+
+    #[test_case("vision-model", true; "catalog_marks_model_as_vision")]
+    #[test_case("text-model", false; "catalog_marks_model_as_text_only")]
+    fn supports_vision_falls_back_to_catalog_for_builtins(model_id: &str, expected: bool) {
+        let (_tmp, state_dir) = temp_state_dir();
+        let models = HashMap::from([
+            (
+                "vision-model".into(),
+                CatalogModel {
+                    attachment: true,
+                    ..Default::default()
+                },
+            ),
+            ("text-model".into(), CatalogModel::default()),
+        ]);
+        let index: CatalogIndex = HashMap::from([(
+            "opencode-go".into(),
+            CatalogProvider {
+                name: "Opencode Go".into(),
+                env: vec!["OPENCODE_API_KEY".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://opencode.ai/zen/go/v1".into()),
+                models,
+            },
+        )]);
+        super::seed_catalog_for_tests(index, state_dir);
+
+        let model = super::Model::from_spec(&format!("opencode-go/{model_id}")).unwrap();
+        assert_eq!(model.supports_vision(), expected);
+    }
+
+    #[test]
+    fn catalog_miss_falls_back_to_family() {
+        let (_tmp, state_dir) = temp_state_dir();
+        super::warm_empty_catalog_for_tests(state_dir);
+
+        let model = super::Model::from_spec("opencode-go/unlisted-model").unwrap();
+        assert!(!model.supports_vision());
+    }
+
+    /// The catalog is the last word before the family guess, so anything more
+    /// specific still wins. Only discovery can be exercised here: the builtins
+    /// the catalog keeps (`opencode`, `opencode-go`) list no manifest models.
+    #[test]
+    fn discovery_beats_catalog_vision() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let models = HashMap::from([(
+            "omen-alpha".into(),
+            CatalogModel {
+                attachment: true,
+                ..Default::default()
+            },
+        )]);
+        let index: CatalogIndex = HashMap::from([(
+            "opencode-go".into(),
+            CatalogProvider {
+                name: "Opencode Go".into(),
+                env: vec!["OPENCODE_API_KEY".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://opencode.ai/zen/go/v1".into()),
+                models,
+            },
+        )]);
+        super::seed_catalog_for_tests(index, state_dir);
+        crate::model_registry::set_known_models(
+            "opencode-go",
+            vec![ModelInfo {
+                supports_vision: Some(false),
+                ..ModelInfo::id_only("omen-alpha".into())
+            }],
+        );
+
+        let model = super::Model::from_spec("opencode-go/omen-alpha").unwrap();
+        assert!(
+            !model.supports_vision(),
+            "discovery must win over catalog metadata"
+        );
     }
 
     #[test]

@@ -1510,6 +1510,8 @@ fn cancelling_from_inside_a_subagent_reports_error() {
 const OVERLAY_BLOCKED_KEYS: &[KeyEvent] = &[
     kb::SCROLL_HALF_UP.to_key_event(),
     kb::SCROLL_HALF_DOWN.to_key_event(),
+    kb::SCROLL_PAGE_UP.to_key_event(),
+    kb::SCROLL_PAGE_DOWN.to_key_event(),
     kb::HELP.to_key_event(),
 ];
 
@@ -1549,6 +1551,42 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
         app.chats[app.active_chat].scroll_pos(),
         scroll_before,
         "scroll changed through overlay"
+    );
+}
+
+#[test]
+fn page_keys_scroll_the_transcript_by_one_page() {
+    let area = Rect::new(0, 0, 80, 20);
+    let mut app = app_with_transcript(area);
+    let start = app.active_chat().win_view();
+    assert!(
+        start.scroll_top > 0,
+        "the transcript must overflow the viewport for this to prove anything"
+    );
+
+    app.update(Msg::Key(kb::SCROLL_PAGE_UP.to_key_event()));
+    let up = app.active_chat().win_view();
+    assert_eq!(
+        start.scroll_top - up.scroll_top,
+        u32::from(start.height),
+        "page up moves the viewport up by one page"
+    );
+    assert!(!up.auto_scroll, "page up unpins the transcript");
+
+    app.update(Msg::Key(kb::SCROLL_PAGE_DOWN.to_key_event()));
+    let backend = ratatui::backend::TestBackend::new(area.width, area.bottom());
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| app.active_chat().view(frame, area, false))
+        .unwrap();
+    let down = app.active_chat().win_view();
+    assert_eq!(
+        down.scroll_top, start.scroll_top,
+        "page down lands back on the bottom"
+    );
+    assert!(
+        down.auto_scroll,
+        "landing on the bottom re-pins the transcript"
     );
 }
 
@@ -5059,6 +5097,57 @@ fn mid_batch_checkpoint_does_not_shadow_the_real_tool_results() {
         panic!("expected one real tool result: {:?}", loaded.messages()[2]);
     };
     assert_eq!((content.as_str(), *is_error), (MID_BATCH_RESULT, false));
+}
+
+/// The plugin behind a restored call sees only the item, so a session picked
+/// from the picker has to file its calls under its own id and as a load,
+/// never under whichever session was on screen when the restore ran.
+#[test]
+fn loading_a_session_stamps_its_restores_as_a_load_of_that_session() {
+    let (_tmp, dir, _writer, mut app) = tempdir_app();
+    let mut stored = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
+    stored.push_message(tool_use_msg(SUB_TOOL_ID));
+    stored.push_message(tool_result_msg(SUB_TOOL_ID, &tool_text(SUB_TOOL_ID)));
+    stored.save(&dir).unwrap();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
+
+    app.load_session(stored.id);
+
+    let item = probe
+        .try_recv_restore_item()
+        .expect("the stored call is restored");
+    assert_eq!(item.session_id.map(|s| s.id()), Some(stored.id));
+    assert_eq!(item.task_id, None);
+    assert_eq!(item.reason, maki_lua::RestoreReason::Load);
+}
+
+/// A chat is stamped with its session when built, so the reset has to swap
+/// the session before it rebuilds the chats, or every later click and theme
+/// change would restore under the session that just ended.
+#[test]
+fn reset_session_stamps_the_new_main_chat_with_the_new_session() {
+    let mut app = test_app();
+    let previous = app.state.session.id;
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
+    let (_, items) = crate::chat::history_to_display(
+        &[
+            tool_use_msg(SUB_TOOL_ID),
+            tool_result_msg(SUB_TOOL_ID, &tool_text(SUB_TOOL_ID)),
+        ],
+        &HashMap::new(),
+        &app.ui_config.tool_output_lines,
+    );
+
+    app.reset_session();
+    app.chats[0].request_restores(items);
+
+    let item = probe.try_recv_restore_item().expect("the call is restored");
+    assert_ne!(app.state.session.id, previous);
+    assert_eq!(item.session_id.map(|s| s.id()), Some(app.state.session.id));
 }
 
 /// In the window between a rewind and the agent respawn, syncing from the

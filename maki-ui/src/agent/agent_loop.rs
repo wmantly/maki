@@ -195,6 +195,7 @@ impl AgentLoop {
             event_tx,
             &self.config,
             instructions,
+            self.session_id.as_ref(),
         )
         .await
     }
@@ -264,6 +265,7 @@ impl AgentLoop {
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
                 session_id: self.session_id.clone(),
+                task_id: None,
                 mailbox: self.mailbox.clone(),
                 timeouts: self.timeouts,
                 file_access: Arc::clone(&self.file_access),

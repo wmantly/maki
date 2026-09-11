@@ -39,6 +39,7 @@ libc = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
 open = { workspace = true }
+unicode-width = { workspace = true }
 
 # isahc's `static-ssl` feature is supposed to make curl-sys build a vendored
 # (bundled-source) OpenSSL, which is required on Windows (no system OpenSSL
@@ -75,7 +76,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.5.1-anchor-17"
+version = "0.5.3-anchor-1"
 edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"

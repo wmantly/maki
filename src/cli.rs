@@ -201,7 +201,16 @@ pub enum Command {
         action: AuthAction,
     },
     /// List all available models
-    Models,
+    Models {
+        /// Refetch the models.dev catalog, ignoring its 24h cache
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Manage sessions
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
     /// Run the index tool on a file to see how it looks like
     Index { path: String },
     /// Manage MCP server authentication
@@ -248,6 +257,25 @@ pub enum Command {
     Migrate {
         #[command(subcommand)]
         action: MigrateAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SessionAction {
+    /// List sessions
+    List {
+        /// Show sessions from all projects
+        #[arg(short, long)]
+        global: bool,
+    },
+    /// Delete a session
+    Delete {
+        /// Session ID (see `maki session list`)
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        force: bool,
     },
 }
 
