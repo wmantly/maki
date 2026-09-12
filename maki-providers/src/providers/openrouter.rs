@@ -11,7 +11,7 @@ use crate::{
     dialect,
 };
 
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
 const REFERER: &str = "https://maki.sh";
@@ -224,7 +224,9 @@ impl Provider for OpenRouter {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            self.compat.fetch_and_parse_models(&auth, parse_model).await
+            self.compat
+                .fetch_and_parse_models(&auth, MODELS_PATH, parse_model)
+                .await
         })
     }
 
@@ -332,9 +334,11 @@ mod tests {
             supports_tool_examples_override: None,
             thinking_override: None,
             supports_vision_override: None,
+            supports_fast_override: None,
             pricing: ModelPricing::default(),
             discovered_free: false,
             max_output_tokens: Some(8192),
+            turn_output_tokens: None,
             context_window: 200_000,
             thinking_fields: None,
         };

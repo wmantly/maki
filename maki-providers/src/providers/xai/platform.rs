@@ -305,9 +305,11 @@ mod tests {
                 crate::model::ThinkingSupport::No
             }),
             supports_vision_override: Some(true),
+            supports_fast_override: None,
             pricing: ModelPricing::ZERO,
             discovered_free: false,
             max_output_tokens: Some(131_072),
+            turn_output_tokens: None,
             context_window: 500_000,
             thinking_fields: None,
         }

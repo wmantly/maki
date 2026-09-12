@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::model::{Model, ModelInfo};
+use crate::model::{FastSupport, Model, ModelInfo};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::types::EffortDialect;
@@ -52,6 +52,8 @@ const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_CLIENT_VERSION: &str = "0.153.4";
 const PLAN_MODELS_PATH: &str = "/models?client_version=";
 const LISTED_VISIBILITY: &str = "list";
+const ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
+const FAST_SERVICE_TIER: &str = "priority";
 const IMAGE_MODALITY: &str = "image";
 const EMPTY_USAGE_ERROR: &str =
     "OpenAI usage response contained no plan or rate limits; the endpoint schema likely changed";
@@ -98,6 +100,13 @@ struct PlanModel {
     default_reasoning_level: Option<String>,
     supported_reasoning_levels: Vec<PlanReasoningLevel>,
     input_modalities: Vec<String>,
+    service_tiers: Vec<PlanServiceTier>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PlanServiceTier {
+    id: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -112,6 +121,8 @@ pub(crate) struct PlanModelInfo {
     efforts: Vec<Effort>,
     adaptive: Option<Effort>,
     off: bool,
+    supports_fast: bool,
+    account_id: Option<String>,
 }
 
 impl PlanModelInfo {
@@ -124,9 +135,11 @@ impl PlanModelInfo {
     }
 }
 
-impl From<PlanModel> for ModelInfo {
-    fn from(model: PlanModel) -> Self {
-        let levels = &model.supported_reasoning_levels;
+impl PlanModel {
+    /// The account id rides along so a later lookup can tell whether the
+    /// listing still belongs to whoever is logged in now.
+    fn into_info(self, account_id: Option<&str>) -> ModelInfo {
+        let levels = &self.supported_reasoning_levels;
         let mut efforts: Vec<Effort> = levels
             .iter()
             .filter_map(|level| level.effort.parse().ok())
@@ -134,33 +147,41 @@ impl From<PlanModel> for ModelInfo {
         efforts.sort_unstable();
         efforts.dedup();
         let info = PlanModelInfo {
+            account_id: account_id.map(str::to_owned),
+            supports_fast: self
+                .service_tiers
+                .iter()
+                .any(|tier| tier.id == FAST_SERVICE_TIER),
             off: levels.iter().any(|level| level.effort == dialect::OFF),
-            adaptive: model
+            adaptive: self
                 .default_reasoning_level
                 .and_then(|level| level.parse().ok()),
             efforts,
         };
-        Self {
-            id: model.slug,
-            context_window: model.context_window,
+        ModelInfo {
+            id: self.slug,
+            context_window: self.context_window,
             max_output_tokens: None,
             pricing: None,
             supports_thinking: Some(!info.efforts.is_empty()),
-            supports_vision: (!model.input_modalities.is_empty())
-                .then(|| model.input_modalities.iter().any(|m| m == IMAGE_MODALITY)),
+            supports_vision: (!self.input_modalities.is_empty())
+                .then(|| self.input_modalities.iter().any(|m| m == IMAGE_MODALITY)),
             tier: None,
             provider_info: Some(Arc::new(info)),
         }
     }
 }
 
-fn parse_plan_models(response: &str) -> Result<Vec<ModelInfo>, AgentError> {
+fn parse_plan_models(
+    response: &str,
+    account_id: Option<&str>,
+) -> Result<Vec<ModelInfo>, AgentError> {
     let parsed: PlanModelsResponse = serde_json::from_str(response)?;
     let models: Vec<ModelInfo> = parsed
         .models
         .into_iter()
         .filter(|model| model.visibility == LISTED_VISIBILITY)
-        .map(ModelInfo::from)
+        .map(|model| model.into_info(account_id))
         .collect();
     if models.is_empty() {
         return Err(AgentError::Config {
@@ -168,6 +189,56 @@ fn parse_plan_models(response: &str) -> Result<Vec<ModelInfo>, AgentError> {
         });
     }
     Ok(models)
+}
+
+fn plan_account_id(auth: &ResolvedAuth) -> Option<&str> {
+    auth.headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(ACCOUNT_ID_HEADER))
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !value.is_empty())
+}
+
+/// Fast is a subscription perk, so it takes a coding-plan login *and* a listing
+/// that was fetched for that same account: switch accounts and yesterday's
+/// answer is worthless. `Pending` is the honest answer while the listing is
+/// still in flight, so the ui can hold on to a `/fast` typed at startup.
+fn supports_plan_fast(
+    auth: Option<&ResolvedAuth>,
+    info: Option<&PlanModelInfo>,
+    discovery_complete: bool,
+) -> FastSupport {
+    let account_id = auth
+        .filter(|auth| auth.base_url.as_deref() == Some(auth::CODING_PLAN_BASE_URL))
+        .and_then(plan_account_id);
+    let Some(account_id) = account_id else {
+        return FastSupport::Unsupported;
+    };
+    match info {
+        Some(info) if info.account_id.as_deref() == Some(account_id) => {
+            if info.supports_fast {
+                FastSupport::Supported
+            } else {
+                FastSupport::Unsupported
+            }
+        }
+        None if !discovery_complete => FastSupport::Pending,
+        _ => FastSupport::Unsupported,
+    }
+}
+
+/// Re-checked against the live auth rather than trusting `Model`, whose
+/// override was stamped when the model was built and may predate a re-login.
+fn apply_plan_fast(
+    body: &mut Value,
+    fast: bool,
+    auth: &ResolvedAuth,
+    info: Option<&PlanModelInfo>,
+) {
+    let complete = model_registry::discovery_complete(CONFIG.slug);
+    if fast && supports_plan_fast(Some(auth), info, complete) == FastSupport::Supported {
+        body["service_tier"] = FAST_SERVICE_TIER.into();
+    }
 }
 
 fn static_plan_models() -> Vec<ModelInfo> {
@@ -319,7 +390,10 @@ impl OpenAi {
             "{}{PLAN_MODELS_PATH}{CODEX_CLIENT_VERSION}",
             auth::CODING_PLAN_BASE_URL
         );
-        parse_plan_models(&self.compat.get_text(&auth, &url).await?)
+        parse_plan_models(
+            &self.compat.get_text(&auth, &url).await?,
+            plan_account_id(&auth),
+        )
     }
 }
 
@@ -429,17 +503,18 @@ impl Provider for OpenAi {
                 .map(PlanModelInfo::dialect)
                 .or_else(|| is_codex_model(&model.id).then(|| plan_dialect(&model.id).clone()));
             if let Some(dialect) = plan_dialect {
-                let mut body = super::responses::build_body(model, messages, system, tools);
-                super::responses::apply_responses_reasoning(
-                    &mut body,
-                    opts.thinking,
-                    model,
-                    &dialect,
-                );
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_retry(|| async {
                         let codex_auth = self.codex_auth()?;
+                        let mut body = super::responses::build_body(model, messages, system, tools);
+                        super::responses::apply_responses_reasoning(
+                            &mut body,
+                            opts.thinking,
+                            model,
+                            &dialect,
+                        );
+                        apply_plan_fast(&mut body, opts.fast, &codex_auth, discovered.as_deref());
                         super::responses::do_stream(
                             self.compat.client(),
                             model,
@@ -523,10 +598,21 @@ impl Provider for OpenAi {
         })
     }
 
+    /// An api-key user gets no opinion at all: stamping `Unsupported` here
+    /// would shadow the pricing gate in `Model::supports_fast` for good, and
+    /// that gate is not ours to close.
     fn adjust_model(&self, model: &mut Model) {
-        if self.is_oauth()
-            && let Some(context_window) = coding_plan_context_window(&model.id)
-        {
+        if !self.is_oauth() {
+            return;
+        }
+        let auth = self.codex_auth().ok();
+        let info = model_registry::provider_info::<PlanModelInfo>(CONFIG.slug, &model.id);
+        model.supports_fast_override = Some(supports_plan_fast(
+            auth.as_ref(),
+            info.as_deref(),
+            model_registry::discovery_complete(CONFIG.slug),
+        ));
+        if let Some(context_window) = coding_plan_context_window(&model.id) {
             model.context_window = model.context_window.min(context_window);
         }
     }
@@ -659,6 +745,19 @@ mod tests {
         ]
     }"#;
 
+    const ACCOUNT_ID: &str = "account-a";
+    const OTHER_ACCOUNT_ID: &str = "account-b";
+
+    fn plan_auth(oauth: bool, account_id: Option<&str>) -> ResolvedAuth {
+        ResolvedAuth::for_test(
+            oauth.then(|| auth::CODING_PLAN_BASE_URL.into()),
+            account_id
+                .map(|id| (ACCOUNT_ID_HEADER.into(), id.into()))
+                .into_iter()
+                .collect(),
+        )
+    }
+
     fn plan_info(info: &ModelInfo) -> Arc<PlanModelInfo> {
         info.provider_info
             .clone()
@@ -669,7 +768,7 @@ mod tests {
 
     #[test]
     fn plan_models_keep_listed_models_with_declared_metadata() {
-        let models = parse_plan_models(PLAN_MODELS_RESPONSE).unwrap();
+        let models = parse_plan_models(PLAN_MODELS_RESPONSE, Some(ACCOUNT_ID)).unwrap();
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["gpt-7-nova", "gpt-5.5"]);
 
@@ -683,6 +782,8 @@ mod tests {
                 efforts: vec![Effort::Low, Effort::Medium, Effort::Max],
                 adaptive: Some(Effort::Low),
                 off: false,
+                supports_fast: false,
+                account_id: Some(ACCOUNT_ID.into()),
             }
         );
 
@@ -694,15 +795,158 @@ mod tests {
                 efforts: vec![Effort::High],
                 adaptive: None,
                 off: true,
+                supports_fast: false,
+                account_id: Some(ACCOUNT_ID.into()),
             }
         );
+    }
+
+    #[test_case(json!({}), false ; "missing_metadata")]
+    #[test_case(json!({"service_tiers": []}), false ; "empty_tiers")]
+    #[test_case(json!({"service_tiers": [{"id": "flex"}]}), false ; "other_tier")]
+    #[test_case(json!({"service_tiers": [{"id": "priority"}]}), true ; "priority_tier")]
+    #[test_case(json!({"additional_speed_tiers": ["fast"]}), false ; "legacy_fast_is_not_priority")]
+    fn plan_models_parse_fast_capability(metadata: Value, expected: bool) {
+        let mut model = metadata;
+        model["slug"] = "gpt-7-nova".into();
+        model["visibility"] = LISTED_VISIBILITY.into();
+        let response = json!({"models": [model]}).to_string();
+        let models = parse_plan_models(&response, Some(ACCOUNT_ID)).unwrap();
+        assert_eq!(plan_info(&models[0]).supports_fast, expected);
+    }
+
+    fn plan_model_info(supports_fast: bool) -> PlanModelInfo {
+        PlanModelInfo {
+            efforts: vec![Effort::High],
+            adaptive: Some(Effort::High),
+            off: false,
+            supports_fast,
+            account_id: Some(ACCOUNT_ID.into()),
+        }
+    }
+
+    #[test_case(true, Some(ACCOUNT_ID), None, false, FastSupport::Pending ; "oauth_waits_for_discovery")]
+    #[test_case(true, Some(ACCOUNT_ID), None, true, FastSupport::Unsupported ; "completed_without_model_metadata")]
+    #[test_case(true, Some(ACCOUNT_ID), Some(true), true, FastSupport::Supported ; "oauth_supported")]
+    #[test_case(true, Some(ACCOUNT_ID), Some(false), true, FastSupport::Unsupported ; "oauth_unsupported")]
+    #[test_case(false, Some(ACCOUNT_ID), None, false, FastSupport::Unsupported ; "api_without_discovery")]
+    #[test_case(false, Some(ACCOUNT_ID), Some(true), true, FastSupport::Unsupported ; "api_ignores_plan_support")]
+    #[test_case(true, None, None, false, FastSupport::Unsupported ; "missing_account_never_pends")]
+    fn plan_fast_support(
+        oauth: bool,
+        account_id: Option<&str>,
+        supported: Option<bool>,
+        discovery_complete: bool,
+        expected: FastSupport,
+    ) {
+        let info = supported.map(plan_model_info);
+        let auth = plan_auth(oauth, account_id);
+        assert_eq!(
+            supports_plan_fast(Some(&auth), info.as_ref(), discovery_complete),
+            expected
+        );
+    }
+
+    /// Once the listing lands, a model it never mentioned is a definite no.
+    /// Staying `Pending` forever would leave `/fast` stuck flashing "soon".
+    #[test_case("fast-static-fallback", static_plan_models() ; "static_fallback")]
+    #[test_case("fast-omitted-model", parse_plan_models(PLAN_MODELS_RESPONSE, Some(ACCOUNT_ID)).unwrap() ; "model_omitted")]
+    fn completed_listing_without_fast_metadata(provider: &str, models: Vec<ModelInfo>) {
+        let auth = plan_auth(true, Some(ACCOUNT_ID));
+        assert_eq!(
+            supports_plan_fast(
+                Some(&auth),
+                None,
+                model_registry::discovery_complete(provider)
+            ),
+            FastSupport::Pending
+        );
+        model_registry::set_known_models(provider, models);
+        let info = model_registry::provider_info::<PlanModelInfo>(provider, PLAN_MODELS[0]);
+        assert_eq!(
+            supports_plan_fast(
+                Some(&auth),
+                info.as_deref(),
+                model_registry::discovery_complete(provider),
+            ),
+            FastSupport::Unsupported
+        );
+    }
+
+    #[test_case(Some(ACCOUNT_ID), Some(ACCOUNT_ID), FastSupport::Supported ; "matching_account")]
+    #[test_case(Some(ACCOUNT_ID), Some(OTHER_ACCOUNT_ID), FastSupport::Unsupported ; "changed_account")]
+    #[test_case(None, Some(ACCOUNT_ID), FastSupport::Unsupported ; "missing_current_account")]
+    #[test_case(Some(ACCOUNT_ID), None, FastSupport::Unsupported ; "missing_discovery_account")]
+    #[test_case(Some(""), Some(""), FastSupport::Unsupported ; "empty_accounts_do_not_match")]
+    fn plan_fast_scopes_discovery_to_account(
+        current_account: Option<&str>,
+        discovered_account: Option<&str>,
+        expected: FastSupport,
+    ) {
+        let response = json!({"models": [{
+            "slug": "gpt-7-nova",
+            "visibility": LISTED_VISIBILITY,
+            "service_tiers": [{"id": FAST_SERVICE_TIER}]
+        }]})
+        .to_string();
+        let models = parse_plan_models(&response, discovered_account).unwrap();
+        let info = plan_info(&models[0]);
+        let auth = plan_auth(true, current_account);
+        assert_eq!(supports_plan_fast(Some(&auth), Some(&info), true), expected);
+        let mut body = json!({});
+        apply_plan_fast(&mut body, true, &auth, Some(&info));
+        assert_eq!(
+            body["service_tier"].as_str(),
+            (expected == FastSupport::Supported).then_some(FAST_SERVICE_TIER)
+        );
+    }
+
+    /// Fast has to survive the whole trip: the option gate, then the body. And
+    /// when it is off, the request must come out byte for byte like it always
+    /// did, so nothing sneaks into a plain call.
+    #[test_case(true, true, true, true ; "eligible_oauth")]
+    #[test_case(false, true, true, false ; "disabled")]
+    #[test_case(true, false, true, false ; "api_key")]
+    #[test_case(true, true, false, false ; "unsupported")]
+    fn plan_fast_requires_enabled_eligible_subscription(
+        fast: bool,
+        oauth: bool,
+        supported: bool,
+        expected: bool,
+    ) {
+        let info = plan_model_info(supported);
+        let mut model = Model::from_spec("openai/gpt-5.5").unwrap();
+        let auth = plan_auth(oauth, Some(ACCOUNT_ID));
+        model.supports_fast_override = Some(supports_plan_fast(Some(&auth), Some(&info), true));
+        let opts = RequestOptions {
+            thinking: ThinkingConfig::Adaptive,
+            fast,
+        };
+        assert_eq!(opts.clamped(&model).fast, expected);
+        let mut body = responses::build_body(&model, &[], "", &json!([]));
+        responses::apply_responses_reasoning(
+            &mut body,
+            opts.thinking,
+            &model,
+            plan_dialect(&model.id),
+        );
+        let standard = body.clone();
+        apply_plan_fast(&mut body, fast, &auth, Some(&info));
+        assert_eq!(
+            body["service_tier"].as_str(),
+            expected.then_some(FAST_SERVICE_TIER)
+        );
+        body.as_object_mut().unwrap().remove("service_tier");
+        assert_eq!(body, standard);
     }
 
     #[test_case("{}")]
     #[test_case(r#"{"models": [{"slug": "x", "visibility": "hide"}]}"#)]
     fn plan_models_reject_responses_without_visible_models(response: &str) {
         assert_eq!(
-            parse_plan_models(response).unwrap_err().to_string(),
+            parse_plan_models(response, Some(ACCOUNT_ID))
+                .unwrap_err()
+                .to_string(),
             EMPTY_MODELS_ERROR
         );
     }
@@ -716,7 +960,7 @@ mod tests {
         thinking: ThinkingConfig,
         expected: Option<&str>,
     ) {
-        let models = parse_plan_models(PLAN_MODELS_RESPONSE).unwrap();
+        let models = parse_plan_models(PLAN_MODELS_RESPONSE, Some(ACCOUNT_ID)).unwrap();
         let info = plan_info(&models[index]);
         let model = Model::from_spec(&format!("openai/{}", models[index].id)).unwrap();
         let mut body = json!({});

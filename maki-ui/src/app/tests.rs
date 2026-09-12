@@ -18,17 +18,21 @@ use maki_agent::{
     DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
     McpSnapshotReader, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
-use maki_config::{Effect, PermissionRule, PermissionsConfig, ToolKey, UiConfig};
+use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
     BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader, PackCommand,
     PackPlan, PackPreparation, PackReport, SessionEndReason,
 };
-use maki_providers::{ContentBlock, Effort, Message, Role, THINKING_USAGE, TokenUsage};
+use maki_providers::{
+    ContentBlock, Effort, Message, RequestOptions, Role, THINKING_USAGE, TokenUsage,
+};
 use maki_storage::sessions::{SessionMeta, StoredMode, StoredThinking};
+use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -55,6 +59,7 @@ const RESUMED_PROMPT: &str = "carry me over";
 const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
 const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
 const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
+const THINKING_OPTIONS: &str = "thinking_options";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
 const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
@@ -71,6 +76,10 @@ const PERMISSIONS_CWD: &str = "/tmp";
 /// The rewind fixture holds a few dozen bytes of chat, far below this, so it
 /// doubles as the window the gauge is allowed to land in.
 const SMALL_HISTORY: u32 = 1_000;
+const AGENT_ERROR_MSG: &str = "boom";
+const MULTIBYTE_ERROR_CHAR: &str = "é";
+const TRUST: &str = "/trust";
+const GATED_INIT_SOURCE: &str = "-- shipped by the project";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -101,6 +110,7 @@ fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
             ..Default::default()
         },
         PathBuf::from(PERMISSIONS_CWD),
+        ProjectConfig::for_project(Path::new(PERMISSIONS_CWD)),
         Arc::default(),
     ))
 }
@@ -252,6 +262,7 @@ fn subagent_info_with_tx(
         name: name.into(),
         prompt: None,
         model: None,
+        opts: None,
         answer_tx,
     }
 }
@@ -556,7 +567,7 @@ fn queue_item_consumed_pushes_deferred_user_message() {
     app.update(agent_msg_with_run_id(
         AgentEvent::QueueItemConsumed {
             text: "queued".into(),
-            image_count: 0,
+            images: Vec::new(),
         },
         app.run_id,
     ));
@@ -580,12 +591,26 @@ fn queue_item_consumed_marks_agent_streaming() {
     app.update(agent_msg_with_run_id(
         AgentEvent::QueueItemConsumed {
             text: "restored".into(),
-            image_count: 0,
+            images: Vec::new(),
         },
         app.run_id,
     ));
 
     assert_eq!(app.status, Status::Streaming);
+}
+
+#[test_case(AGENT_ERROR_MSG.into(), AGENT_ERROR_MSG.into() ; "kept_whole")]
+#[test_case(
+    MULTIBYTE_ERROR_CHAR.repeat(ERROR_BUBBLE_MAX_CHARS + 1),
+    format!("{}{TRUNCATION_PREFIX}", MULTIBYTE_ERROR_CHAR.repeat(ERROR_BUBBLE_MAX_CHARS))
+    ; "capped_on_char_boundary"
+)]
+fn agent_error_lands_in_chat(message: String, expected: String) {
+    let mut app = test_app();
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::Error { message }));
+    assert_eq!(app.chats[0].last_message_role(), Some(&DisplayRole::Error));
+    assert_eq!(app.chats[0].last_message_text(), expected);
 }
 
 #[test_case(error_app as fn(&mut App) ; "error")]
@@ -674,7 +699,7 @@ pub(crate) fn cancel_app(app: &mut App) {
 
 pub(crate) fn error_app(app: &mut App) {
     app.update(agent_msg(AgentEvent::Error {
-        message: "boom".into(),
+        message: AGENT_ERROR_MSG.into(),
     }));
 }
 
@@ -1577,7 +1602,7 @@ fn page_keys_scroll_the_transcript_by_one_page() {
     let backend = ratatui::backend::TestBackend::new(area.width, area.bottom());
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| app.active_chat().view(frame, area, false))
+        .draw(|frame| app.active_chat().view(frame, area, false, true))
         .unwrap();
     let down = app.active_chat().win_view();
     assert_eq!(
@@ -1677,7 +1702,7 @@ fn app_with_transcript(zone: Rect) -> App {
     let backend = ratatui::backend::TestBackend::new(zone.width, zone.bottom());
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| app.active_chat().view(frame, zone, false))
+        .draw(|frame| app.active_chat().view(frame, zone, false, true))
         .unwrap();
     app
 }
@@ -2417,6 +2442,27 @@ fn mouse_down_in_input_creates_input_zone_selection() {
 }
 
 #[test]
+fn resolve_or_create_chat_sets_subagent_opts() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let opts = RequestOptions {
+        thinking: ThinkingConfig::Effort(Effort::High),
+        fast: true,
+    };
+    let mut info = subagent_info(TASK_ID, "research");
+    info.opts = Some(opts);
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "hi".into() },
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(app.chats[1].opts, Some(opts));
+}
+
+#[test]
 fn resolve_or_create_chat_sets_model_id_and_annotation() {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -3036,6 +3082,26 @@ fn rewind_recomputes_context_size(measured: u32, floor: u32) {
         floor + SMALL_HISTORY
     );
     assert_eq!(app.chats[0].context_size, size);
+}
+
+/// Left at the pre-compaction value, a session compacted just before exit
+/// compacts itself again on resume.
+#[test]
+fn compaction_lowers_the_stored_context_size() {
+    const AFTER: u32 = SMALL_HISTORY;
+    let mut app = test_app();
+    app.run_id = 1;
+    app.state.context_size = MEASURED_CONTEXT;
+    app.chats[0].context_size = MEASURED_CONTEXT;
+
+    app.update(agent_msg(AgentEvent::CompactionDone {
+        context_size_before: MEASURED_CONTEXT,
+        context_size_after: AFTER,
+        context_window: 0,
+    }));
+
+    assert_eq!(app.state.context_size, AFTER);
+    assert_eq!(app.chats[0].context_size, AFTER);
 }
 
 #[test]
@@ -4185,53 +4251,6 @@ fn bash_prefix_overrides_mode() {
 }
 
 #[test]
-fn thinking_toggle_cycles_off_adaptive() {
-    let mut app = test_app();
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Adaptive);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-}
-
-#[test]
-fn thinking_explicit_args() {
-    let mut app = test_app();
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/thinking".into(),
-            args: "8192".into(),
-            bang: false,
-        },
-        0,
-    );
-    assert_eq!(app.state.thinking, ThinkingConfig::Budget(8192));
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/thinking".into(),
-            args: "high".into(),
-            bang: false,
-        },
-        0,
-    );
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
-}
-
-#[test]
-fn thinking_unsupported_model_flashes_error() {
-    let mut app = test_app();
-    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::No);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-    assert_eq!(app.status_bar.flash_text(), Some(THINKING_UNSUPPORTED_MSG));
-}
-
-#[test]
 fn package_commands_are_user_only_and_preserve_update_bang() {
     let mut app = test_app();
     let typed = || ParsedCommand {
@@ -4304,6 +4323,7 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
+        true,
     );
 
     app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
@@ -4447,7 +4467,7 @@ fn model_state_reports_the_model_and_what_it_supports() {
     let mut app = test_app();
     app.state.model = maki_providers::Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
     assert_eq!(
-        app.model_state(),
+        model_state_scalars(&app),
         serde_json::json!({
             "spec": PLAIN_MODEL_SPEC,
             "id": "qwen3",
@@ -4463,7 +4483,7 @@ fn model_state_reports_the_model_and_what_it_supports() {
     app.set_thinking("high").unwrap();
     app.set_fast(true).unwrap();
     assert_eq!(
-        app.model_state(),
+        model_state_scalars(&app),
         serde_json::json!({
             "spec": OPUS_SPEC,
             "id": "claude-opus-4-8",
@@ -4474,6 +4494,53 @@ fn model_state_reports_the_model_and_what_it_supports() {
             "supports_fast": true,
         })
     );
+}
+
+/// The ladder moves with the model table, so it gets its own test and the
+/// pinned payloads stay on the fields that do not.
+fn model_state_scalars(app: &App) -> serde_json::Value {
+    let mut state = app.model_state();
+    state
+        .as_object_mut()
+        .expect("model_state is an object")
+        .remove(THINKING_OPTIONS);
+    state
+}
+
+/// The `/thinking` picker draws its rows from this payload alone, so the state
+/// has to carry the ladder, named rows with their budgets, and an empty one
+/// where there is nothing to pick from. Which rows there are is
+/// `Model::thinking_options`'s business.
+#[test]
+fn model_state_carries_the_thinking_ladder() {
+    let mut app = test_app();
+    set_opus_model(&mut app);
+
+    let ladder = app.model_state()[THINKING_OPTIONS].clone();
+    assert_eq!(ladder[0]["name"], "off");
+    assert!(
+        ladder
+            .as_array()
+            .expect("the ladder is an array")
+            .iter()
+            .any(|option| option["tokens"].is_u64()),
+        "an effort row carries what it costs: {ladder}"
+    );
+
+    app.state.model = maki_providers::Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
+    assert_eq!(app.model_state()[THINKING_OPTIONS], serde_json::json!([]));
+}
+
+/// `Off` is not a state a model that requires thinking can be in, so storing it
+/// would report one level while the request sent another.
+#[test]
+fn set_thinking_clamps_to_what_the_model_will_run() {
+    let mut app = test_app();
+    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::Required);
+
+    let lifted = ThinkingConfig::Effort(Effort::Minimal);
+    assert_eq!(app.set_thinking("off").unwrap(), lifted);
+    assert_eq!(app.state.thinking, lifted);
 }
 
 /// A plugin redraws its badge from the payload alone, and only when the model
@@ -4624,6 +4691,7 @@ fn ctrl_c_denies_permission_prompt() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
+        true,
     );
     assert!(app.permission_prompt.is_open());
 
@@ -4764,6 +4832,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         maki_config::ToolKey::native("bash"),
         vec!["ls".into()],
         None,
+        true,
     );
 
     let (_msg, _bottom, _status, _input, splits) = app.layout_geometry(TEST_AREA);
@@ -4974,6 +5043,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
+        true,
     );
     assert_eq!(
         app.attention(),
@@ -4982,8 +5052,13 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         })
     );
 
-    app.permission_prompt
-        .open("id".into(), maki_config::ToolKey::Wildcard, vec![], None);
+    app.permission_prompt.open(
+        "id".into(),
+        maki_config::ToolKey::Wildcard,
+        vec![],
+        None,
+        true,
+    );
     assert_eq!(
         app.attention(),
         Some(Notification::PermissionRequested { tool: None })
@@ -5419,6 +5494,54 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
     assert_eq!(ids, [FINISHED_TASK_ID]);
 }
 
+/// A folder that ships exactly one gated file, plus the question a start in it
+/// would pose. Written into a tempdir so the grant is about a path nothing else
+/// on the machine owns.
+fn question_about_a_gated_folder(project: &Path) -> TrustQuestion {
+    let gated = project.join(GatedFile::InitLua.to_string());
+    fs::create_dir_all(gated.parent().unwrap()).unwrap();
+    fs::write(&gated, GATED_INIT_SOURCE).unwrap();
+    TrustQuestion::for_folder(&CanonicalFolder::resolve(project).unwrap())
+}
+
+/// `/trust` is `maki trust add --yes` from inside the TUI, so it has to leave
+/// the same record on disk. The reload is the other half: the project config it
+/// just granted only loads on a fresh start.
+#[test]
+fn trust_command_records_the_folder_and_reloads() {
+    let (_state, storage, _writer, mut app) = tempdir_app();
+    let project = TempDir::new().unwrap();
+    let question = question_about_a_gated_folder(project.path());
+    app.trust_question = Some(question.clone());
+
+    app.execute_command(cmd(TRUST), 0);
+
+    assert!(
+        TrustedFolders::new(&storage)
+            .contains(&question.folder)
+            .unwrap(),
+        "the grant must outlive the process"
+    );
+    assert_eq!(app.exit_request, ExitRequest::Reload);
+    assert_eq!(
+        app.status_bar.flash_text().unwrap(),
+        format!("{TRUSTED_PREFIX}{}", GatedFile::InitLua)
+    );
+}
+
+/// Nothing to grant is not a reason to tear the session down: the user would
+/// lose the chat to a no-op.
+#[test]
+fn trust_command_without_a_question_flashes_and_stays() {
+    let (_state, _storage, _writer, mut app) = tempdir_app();
+
+    let actions = app.execute_command(cmd(TRUST), 0);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(NOTHING_TO_TRUST_MSG));
+    assert_eq!(app.exit_request, ExitRequest::None);
+}
+
 #[test]
 fn run_builtin_file_picker_opens_modal() {
     let mut app = test_app();
@@ -5578,6 +5701,7 @@ fn remote_permission_answer_rejects_unknown_answer() {
         maki_config::ToolKey::native("bash"),
         vec![],
         None,
+        true,
     );
     let err = app
         .answer_remote_permission(RC_REQUEST_ID, "nonsense")
@@ -5594,6 +5718,7 @@ fn remote_permission_answer_routes_and_closes() {
         maki_config::ToolKey::native("bash"),
         vec![],
         None,
+        true,
     );
     app.submit_remote_prompt("hi".into(), vec![]).unwrap();
     app.answer_remote_permission(RC_REQUEST_ID, "allow")

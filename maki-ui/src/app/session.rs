@@ -6,9 +6,8 @@ use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, LoadedSession};
-use maki_agent::agent::estimate_message_tokens;
 use maki_lua::SessionEndReason;
-use maki_providers::{Model, TokenUsage};
+use maki_providers::{Model, RequestOptions, TokenUsage, estimate_message_tokens};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredSubagent};
 
@@ -130,7 +129,7 @@ impl App {
                 self.recoverable_queue.clone()
             },
             thinking: Some(state.thinking.into()),
-            fast: state.fast,
+            fast: state.fast_intent(),
             workflow: state.workflow,
             yolo: self.permissions.persisted_yolo(),
         }
@@ -150,6 +149,8 @@ impl App {
                     tool_use_id: tool_id.clone(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
+                    thinking: chat.opts.map(|o| o.thinking.into()),
+                    fast: chat.opts.is_some_and(|o| o.fast),
                 }
             })
             .collect();
@@ -239,6 +240,10 @@ impl App {
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.model_id = sa.model;
+            chat.opts = sa.thinking.map(|thinking| RequestOptions {
+                thinking: thinking.into(),
+                fast: sa.fast,
+            });
             chat.load_messages(display);
             // The session file keeps the transcript but never how it ended,
             // so a reload admits that instead of guessing.
@@ -304,7 +309,7 @@ impl App {
         session.meta = SessionMeta {
             mode: Some(self.state.mode.into()),
             thinking: Some(self.state.thinking.into()),
-            fast: self.state.fast,
+            fast: self.state.fast_intent(),
             workflow: self.state.workflow,
             plan_path: None,
             plan_written: false,
@@ -414,5 +419,62 @@ impl App {
         };
         let loaded = self.apply_loaded_session(session, &self.state.model.clone());
         vec![Action::LoadSession(Box::new(loaded))]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::tests::test_app;
+    use crate::app::{App, FAST_OFF_MSG, FAST_PENDING_MSG};
+    use crate::components::command::ParsedCommand;
+    use maki_providers::model::FastSupport;
+    use test_case::test_case;
+
+    fn pending_app() -> App {
+        let mut app = test_app();
+        app.state.model.supports_fast_override = Some(FastSupport::Pending);
+        app
+    }
+
+    /// A `/fast` typed before the model list lands has to outlive the snapshot
+    /// a new session inherits, otherwise the answer arrives and the wish is
+    /// already gone.
+    #[test_case(false ; "kept")]
+    #[test_case(true ; "cancelled")]
+    fn pending_fast_survives_snapshot_until_discovery_answers(cancel: bool) {
+        let mut app = pending_app();
+        app.set_fast(true).unwrap();
+        if cancel {
+            app.set_fast(false).unwrap();
+        }
+        assert!(!app.state.fast);
+        assert_eq!(app.state.pending_fast, !cancel);
+        assert_eq!(app.build_meta().fast, !cancel);
+        assert_eq!(app.blank_session().meta.fast, !cancel);
+
+        let mut model = app.state.model.clone();
+        model.supports_fast_override = Some(FastSupport::Supported);
+        app.update_model(&model);
+        assert_eq!(app.state.fast, !cancel);
+        assert!(!app.state.pending_fast);
+        assert_eq!(app.build_meta().fast, !cancel);
+    }
+
+    #[test]
+    fn fast_command_flashes_pending_while_discovery_runs() {
+        let mut app = pending_app();
+        for expected in [FAST_PENDING_MSG, FAST_OFF_MSG] {
+            app.execute_command(
+                ParsedCommand {
+                    name: "/fast".into(),
+                    args: String::new(),
+                    bang: false,
+                },
+                0,
+            );
+            assert_eq!(app.status_bar.flash_text(), Some(expected));
+            assert!(!app.state.fast);
+        }
+        assert!(!app.state.pending_fast);
     }
 }

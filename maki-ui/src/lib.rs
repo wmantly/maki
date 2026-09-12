@@ -25,7 +25,9 @@ pub mod splash;
 mod storage_writer;
 mod text_buffer;
 mod theme;
+mod trust_card;
 pub use theme::BUNDLED_THEMES;
+pub use trust_card::ask_trust;
 pub mod update;
 pub mod wrap;
 
@@ -33,6 +35,7 @@ mod agent;
 mod event_loop;
 mod input;
 mod terminal;
+mod terminal_image;
 
 use std::time::Instant;
 

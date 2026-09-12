@@ -9,7 +9,7 @@ use include_dir::{Dir, File, include_dir};
 use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
-use maki_config::{PluginsConfig, RawConfig};
+use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
@@ -34,6 +34,33 @@ pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
 /// Tests assert on this exact text, so a wording tweak here updates them too.
 pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for the builtin \
      tool of the same name, together with any \"always allow\" you saved";
+pub const TRUST_SCOPE_WARNING: &str =
+    "trust is only read from the global init.lua; ignoring the trust table in";
+
+/// How far user `init.lua` may reach. `--no-plugins` turns it off, and a
+/// project folder nobody vouched for stops at the global file.
+///
+/// The project variant carries the path instead of a trust verdict, so the only
+/// way to build one is a `Some` out of [`ProjectConfig::gated_path`] and
+/// "trusted" cannot disagree with "which file".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InitFiles {
+    Disabled,
+    Global,
+    GlobalAndProject(PathBuf),
+}
+
+impl InitFiles {
+    pub fn resolve(project_config: &ProjectConfig, no_plugins: bool) -> Self {
+        if no_plugins {
+            return InitFiles::Disabled;
+        }
+        match project_config.gated_path(GatedFile::InitLua) {
+            Some(path) => InitFiles::GlobalAndProject(path),
+            None => InitFiles::Global,
+        }
+    }
+}
 
 struct BundledPlugin {
     name: &'static str,
@@ -46,6 +73,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "sessions",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
+    },
+    BundledPlugin {
+        name: "thinking",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/thinking"),
     },
     BundledPlugin {
         name: "index",
@@ -297,12 +328,29 @@ impl PluginHost {
     /// `plugin.toml` skips that directory's Lua) for the caller to surface.
     pub fn load_init_files(
         &self,
-        cwd: &Path,
+        init_files: InitFiles,
         warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
+        self.load_init_files_from_dirs(
+            init_files,
+            maki_storage::paths::config_search_dirs(),
+            warnings,
+        )
+    }
+
+    fn load_init_files_from_dirs(
+        &self,
+        init_files: InitFiles,
+        global_dirs: impl IntoIterator<Item = PathBuf>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        if init_files == InitFiles::Disabled {
+            return Ok(None);
+        }
+
         let mut merged: Option<RawConfig> = None;
 
-        for global_dir in maki_storage::paths::config_search_dirs() {
+        for global_dir in global_dirs {
             self.run_init_file(
                 &global_dir.join("init.lua"),
                 ConfigScope::Global,
@@ -313,29 +361,11 @@ impl PluginHost {
                 break;
             }
         }
-        self.run_init_file(
-            &cwd.join(".maki/init.lua"),
-            ConfigScope::Project,
-            &mut merged,
-            warnings,
-        )?;
+        if let InitFiles::GlobalAndProject(path) = &init_files {
+            self.run_init_file(path, ConfigScope::Project, &mut merged, warnings)?;
+        }
 
         Ok(merged)
-    }
-
-    /// `--no-plugins` recovery path: skip every user `init.lua` while the
-    /// host and builtin plugins stay live. Centralized so every entry point
-    /// (TUI, index, acp, prompt) honors the flag identically.
-    pub fn load_init_files_or_skip(
-        &self,
-        no_plugins: bool,
-        cwd: &Path,
-        warnings: &mut Vec<String>,
-    ) -> Result<Option<RawConfig>, PluginError> {
-        if no_plugins {
-            return Ok(None);
-        }
-        self.load_init_files(cwd, warnings)
     }
 
     fn run_init_file(
@@ -358,7 +388,17 @@ impl PluginHost {
             return Ok(());
         }
         let owner = scope.label().to_owned();
-        if let Some(raw) = self.send_config_lua(source, scope, plugin_dir)? {
+        let global = matches!(scope, ConfigScope::Global);
+        if let Some(mut raw) = self.send_config_lua(source, scope, plugin_dir)? {
+            // A folder cannot vouch for itself: ACP resolves many
+            // client-chosen cwds against the config it read once at startup,
+            // so one trusted project's `trust.paths` would reach folders
+            // nobody ever trusted. Stripped rather than rejected, because
+            // there is no fallback config at this point and a hard error would
+            // brick the folder the user just trusted over an ignored setting.
+            if !global && std::mem::take(&mut raw.trust).is_set() {
+                warnings.push(format!("{TRUST_SCOPE_WARNING} {owner}"));
+            }
             match merged {
                 Some(existing) => existing.merge(raw),
                 None => *merged = Some(raw),
@@ -1144,6 +1184,9 @@ mod tests {
     use std::time::Instant;
     use test_case::test_case;
 
+    const GLOBAL_TRUST_PATH: &str = "~/src/me/*";
+    const PROJECT_TRUST_PATH: &str = "**";
+
     /// Closing the queue and reading it are one message. A Lua task can record
     /// an activation between a separate read and close, and a close that threw
     /// the queue away would strand exactly the request that was about to be
@@ -1406,13 +1449,8 @@ mod tests {
         }
     }
 
-    /// `load_init_files_or_skip` is the single seam every entry point
-    /// (TUI, index, acp, prompt) uses to honor `--no-plugins`. Verify both
-    /// halves: the flag skips a broken init.lua, and absence runs it (so
-    /// the skip path is not a tautology that hides a regression in the
-    /// unconditional loader).
     #[test]
-    fn load_init_files_or_skip_respects_flag() {
+    fn init_file_scope_controls_project_execution() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".maki")).unwrap();
         fs::write(
@@ -1424,18 +1462,104 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
 
         let mut warnings = Vec::new();
-        let skipped = host
-            .load_init_files_or_skip(true, dir.path(), &mut warnings)
-            .expect("no-plugins skips broken init.lua");
-        assert!(
-            skipped.is_none(),
-            "--no-plugins must skip user init.lua entirely"
-        );
+        for scope in [InitFiles::Disabled, InitFiles::Global] {
+            let skipped = host
+                .load_init_files_from_dirs(scope, [], &mut warnings)
+                .expect("scope skips broken project init.lua");
+            assert!(skipped.is_none());
+        }
 
-        let ran = host.load_init_files_or_skip(false, dir.path(), &mut warnings);
+        let ran = host.load_init_files_from_dirs(
+            InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+            [],
+            &mut warnings,
+        );
         assert!(
             ran.is_err(),
-            "without --no-plugins the broken init.lua must surface as an error"
+            "project-enabled loading must surface the init.lua error"
+        );
+    }
+
+    #[test]
+    fn project_scope_preserves_global_values_and_overrides_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::create_dir(&global).unwrap();
+        fs::write(
+            global.join("init.lua"),
+            "maki.setup({ always_yolo = false, always_fast = true })",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            "maki.setup({ always_yolo = true })",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let global_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let global_only = global_host
+            .load_init_files_from_dirs(InitFiles::Global, [global.clone()], &mut warnings)
+            .unwrap()
+            .unwrap();
+        assert_eq!(global_only.always_yolo, Some(false));
+        assert_eq!(global_only.always_fast, Some(true));
+
+        let project_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let merged = project_host
+            .load_init_files_from_dirs(
+                InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+                [global],
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.always_yolo, Some(true));
+        assert_eq!(merged.always_fast, Some(true));
+    }
+
+    #[test]
+    fn project_scope_cannot_set_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::create_dir(&global).unwrap();
+        fs::write(
+            global.join("init.lua"),
+            format!(
+                "maki.setup({{ trust = {{ paths = {{ \"{GLOBAL_TRUST_PATH}\" }}, prompt = false }} }})"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            format!("maki.setup({{ trust = {{ paths = {{ \"{PROJECT_TRUST_PATH}\" }} }} }})"),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let merged = host
+            .load_init_files_from_dirs(
+                InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+                [global],
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            merged.trust.paths.expect("the global trust table survives"),
+            [GLOBAL_TRUST_PATH]
+        );
+        assert_eq!(merged.trust.prompt, Some(false));
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.starts_with(TRUST_SCOPE_WARNING)
+                    && warning.contains(ConfigScope::Project.label())
+            }),
+            "{warnings:?}"
         );
     }
 

@@ -148,8 +148,10 @@ impl Provider for Opencode {
 
             let stream_model = Model {
                 id: actual_id.to_string(),
-                max_output_tokens: Some(meta.output),
-                context_window: meta.context,
+                // `..model` carries the agent's turn budget, which
+                // [`Model::output_tokens`] clamps to this cap on read.
+                max_output_tokens: Some(meta.max_output()),
+                context_window: meta.context_window(),
                 ..model.clone()
             };
 

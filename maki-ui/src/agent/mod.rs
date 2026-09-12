@@ -67,6 +67,7 @@ impl AgentHandles {
     pub(crate) fn spawn(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         initial_history: Vec<Message>,
+        initial_context_size: u32,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
@@ -81,6 +82,7 @@ impl AgentHandles {
             flume::unbounded(),
             model_slot,
             initial_history,
+            initial_context_size,
             config,
             tool_output_lines,
             permissions,
@@ -154,6 +156,9 @@ impl AgentHandles {
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
             history,
+            // A respawn carries the app's last reported count across, so the
+            // next request is not left guessing at its own prompt.
+            app.state.context_size,
             config,
             tool_output_lines,
             permissions,
@@ -216,6 +221,7 @@ fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
     model_slot: &Arc<ArcSwap<ModelSlot>>,
     initial_history: Vec<Message>,
+    initial_context_size: u32,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
@@ -253,6 +259,7 @@ fn spawn_agent_internal(
         config,
         tool_output_lines,
         initial_history,
+        initial_context_size,
         Arc::clone(&shared_history),
         Arc::clone(&btw_system),
         mcp_handle.clone(),
@@ -291,11 +298,11 @@ fn spawn_agent_internal(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
     use maki_agent::AgentEvent;
-    use maki_config::PermissionsConfig;
+    use maki_config::{PermissionsConfig, ProjectConfig};
     use maki_providers::provider::BoxFuture;
     use maki_providers::{AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -350,11 +357,13 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
+            ProjectConfig::for_project(Path::new("/tmp")),
             Arc::default(),
         ));
         let handles = AgentHandles::spawn(
             &model_slot,
             initial_history,
+            0,
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,

@@ -33,6 +33,7 @@ use super::openai::OpenAi;
 use super::opencode::Opencode;
 use super::openrouter::OpenRouter;
 use super::regolo::Regolo;
+use super::requesty::Requesty;
 use super::synthetic::Synthetic;
 use super::tensorx::TensorX;
 use super::xai::Xai;
@@ -101,9 +102,11 @@ impl ScriptModel {
                 self.requires_thinking,
             ),
             supports_vision_override: self.supports_vision,
+            supports_fast_override: None,
             pricing: self.pricing.clone().unwrap_or_default(),
             discovered_free: false,
             max_output_tokens: Some(self.max_output_tokens),
+            turn_output_tokens: None,
             context_window: self.context_window,
             thinking_fields: self.thinking_fields.clone().map(Box::new),
         }
@@ -588,6 +591,10 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
         ),
         ProviderKind::OpenRouter => Box::new(
             OpenRouter::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
+        ProviderKind::Requesty => Box::new(
+            Requesty::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::TensorX => Box::new(

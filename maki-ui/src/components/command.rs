@@ -100,14 +100,8 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         bang: false,
     },
     BuiltinCommand {
-        name: "/thinking",
-        description: "Toggle extended thinking (off, adaptive, effort level, or budget)",
-        max_args: 1,
-        bang: false,
-    },
-    BuiltinCommand {
         name: "/fast",
-        description: "Toggle Anthropic fast mode (Opus only)",
+        description: "Toggle fast mode (Anthropic Opus or Codex subscription models)",
         max_args: 0,
         bang: false,
     },
@@ -138,6 +132,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "/reload",
         description: "Reload plugins and config",
+        max_args: 0,
+        bang: false,
+    },
+    BuiltinCommand {
+        name: "/trust",
+        description: "Trust this folder and load its shared project config",
         max_args: 0,
         bang: false,
     },

@@ -25,7 +25,8 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
-use maki_config::{ModelPolicy, RemoteControlConfig, UiConfig};
+use maki_config::project::TrustQuestion;
+use maki_config::{ModelPolicy, ProjectConfig, RemoteControlConfig, UiConfig};
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
     SessionSnapshot,
@@ -113,6 +114,10 @@ pub struct EventLoopParams {
     pub ui_attachment: UiAttachment,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
+    pub project_config: ProjectConfig,
+    /// What `/trust` would grant and what the `[restricted]` indicator reports.
+    /// `None` when the folder is trusted or has nothing to ask about.
+    pub trust_question: Option<TrustQuestion>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -342,6 +347,12 @@ struct SessionRuntime {
     /// The permission request last mirrored to remote clients; when the
     /// prompt closes without a remote answer, this is what tells them.
     last_permission_id: Option<String>,
+    /// The slot this session last synced from, compared by identity rather
+    /// than field by field: discovery fills in things like fast support long
+    /// after the model was built, and a hand written list would miss them.
+    /// `None` until the first sync, which is what pulls a restored session off
+    /// its own saved model and onto the one that is selected now.
+    slot: Option<Arc<ModelSlot>>,
 }
 
 impl SessionRuntime {
@@ -393,6 +404,7 @@ struct SpawnCtx {
     available_models: Arc<ArcSwapOption<Vec<String>>>,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
+    trust_question: Option<TrustQuestion>,
 }
 
 impl SpawnCtx {
@@ -402,6 +414,7 @@ impl SpawnCtx {
         let handles = AgentHandles::spawn(
             &self.model_slot,
             session.messages().to_vec(),
+            session.meta.context_size,
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
@@ -430,6 +443,7 @@ impl SpawnCtx {
             self.lua_event_handle.clone(),
             Arc::clone(&self.model_policy),
         );
+        app.trust_question = self.trust_question.clone();
         handles.apply_to_app(&mut app);
         if resumed {
             app.restore_resumed_session();
@@ -444,6 +458,7 @@ impl SpawnCtx {
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
             last_permission_id: None,
+            slot: None,
         }
     }
 }
@@ -511,6 +526,28 @@ fn merge_batch(
     available.store(Some(Arc::new(merged)));
 }
 
+fn resolve_discovered_model(model_slot: &ArcSwap<ModelSlot>, timeouts: Timeouts) {
+    let spec = model_slot.load().model.spec();
+    let mut resolved = match Model::from_spec(&spec) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(spec = %spec, error = %e, "failed to resolve model after discovery");
+            return;
+        }
+    };
+    let provider = match from_model(&mut resolved, timeouts) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(spec = %spec, error = %e, "failed to create provider after discovery");
+            return;
+        }
+    };
+    model_slot.store(Arc::new(ModelSlot {
+        model: resolved,
+        provider: Arc::from(provider),
+    }));
+}
+
 fn spawn_model_fetch(
     model_slot: &Arc<ArcSwap<ModelSlot>>,
     timeouts: Timeouts,
@@ -523,27 +560,7 @@ fn spawn_model_fetch(
     let model_slot = Arc::clone(model_slot);
     let task = smol::spawn(async move {
         let warn_tx = warn_tx_bg;
-        let done = Box::new(move || {
-            let spec = model_slot.load().model.spec();
-            let mut resolved = match Model::from_spec(&spec) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(spec = %spec, error = %e, "failed to resolve model after discovery");
-                    return;
-                }
-            };
-            let provider = match from_model(&mut resolved, timeouts) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(spec = %spec, error = %e, "failed to create provider after discovery");
-                    return;
-                }
-            };
-            model_slot.store(Arc::new(ModelSlot {
-                model: resolved,
-                provider: Arc::from(provider),
-            }));
-        });
+        let done = Box::new(move || resolve_discovered_model(&model_slot, timeouts));
         fetch_all_models(
             &policy,
             |batch| merge_batch(&bg, batch, &warn_tx),
@@ -588,6 +605,8 @@ impl<'t> EventLoop<'t> {
             ui_attachment,
             lua_event_handle,
             model_policy,
+            project_config,
+            trust_question,
         } = params;
         // A `/reload` generation inherits the handles of the one before it,
         // so every loop has to claim the UI back for itself.
@@ -613,7 +632,7 @@ impl<'t> EventLoop<'t> {
         });
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
+        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd, project_config));
 
         let provider: Arc<dyn Provider> = if needs_login {
             Arc::from(maki_providers::provider::from_model_fallback(
@@ -650,6 +669,7 @@ impl<'t> EventLoop<'t> {
             available_models: bg.available,
             storage_writer,
             model_policy,
+            trust_question,
         };
 
         let mut runtimes: Vec<SessionRuntime> = sessions
@@ -1000,18 +1020,15 @@ impl<'t> EventLoop<'t> {
             }
         }
 
-        let slot_model = self.ctx.model_slot.load();
-        let spec = slot_model.model.spec();
+        let slot = self.ctx.model_slot.load_full();
         for rt in &mut self.sessions {
-            if rt.app.state.session.model != spec
-                || rt.app.state.model.context_window != slot_model.model.context_window
-            {
-                rt.app.update_model(&slot_model.model);
+            if rt.slot.as_ref().is_none_or(|s| !Arc::ptr_eq(s, &slot)) {
+                rt.slot = Some(Arc::clone(&slot));
+                rt.app.update_model(&slot.model);
                 dirty = Dirty::YES;
             }
             rt.app.emit_model_change();
         }
-        drop(slot_model);
 
         // These only fire Lua autocmds. Anything a handler does comes back
         // as a `UiAction` on the next wake, which repaints then.
@@ -1374,8 +1391,8 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// Lua acts on the focused session, the same target the model picker and
-    /// `/thinking` write to.
+    /// Lua acts on the focused session, the same target the model picker
+    /// writes to.
     fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
         match req {
             ModelRequest::Get => Ok(self.focused_app().model_state()),
@@ -1645,7 +1662,6 @@ impl<'t> EventLoop<'t> {
                 let run_id = rt.app.run_id;
                 rt.handles.queue.push(QueueItem::Message(QueuedInput {
                     text: input.message.clone(),
-                    image_count: input.images.len(),
                     input,
                     run_id,
                     displayed: true,
@@ -2098,12 +2114,16 @@ impl<'t> EventLoop<'t> {
         let available = Arc::clone(&self.ctx.available_models);
         let warn_tx = self.warn_tx.clone();
         let policy = Arc::clone(&self.ctx.model_policy);
+        let model_slot = Arc::clone(&self.ctx.model_slot);
+        let timeouts = self.ctx.timeouts;
         available.store(None);
         smol::spawn(async move {
             fetch_all_models(
                 &policy,
                 |batch| merge_batch(&available, batch, &warn_tx),
-                None,
+                Some(Box::new(move || {
+                    resolve_discovered_model(&model_slot, timeouts)
+                })),
             )
             .await;
         })
