@@ -6,7 +6,7 @@ use std::time::Duration;
 use flume::Sender;
 use serde_json::json;
 
-use crate::state::{PermissionFrame, RemoteState, RemoteUpdate};
+use crate::state::{PermissionFrame, PlanFrame, RemoteState, RemoteUpdate};
 
 pub const REQUEST_REPLY_TIMEOUT_SECS: u64 = 5;
 pub const SSE_PING_SECS: u64 = 15;
@@ -73,6 +73,7 @@ pub enum Route {
     ServiceWorker,
     Icon,
     Highlight,
+    PlanAction,
 }
 
 impl Route {
@@ -107,6 +108,7 @@ impl Route {
             ("sw.js", "GET") => Some(Route::ServiceWorker),
             ("icon.svg", "GET") => Some(Route::Icon),
             ("highlight", "POST") => Some(Route::Highlight),
+            ("plan", "POST") => Some(Route::PlanAction),
             _ => None,
         }
     }
@@ -560,12 +562,15 @@ impl Dispatcher {
                     body: br#"{"error":"event loop wedged"}"#.to_vec(),
                 },
             },
-            Route::Prompt | Route::Answer | Route::WindowInput | Route::Stop | Route::Command => {
-                match self.dispatch_post(route, session, body) {
-                    Ok(()) => DispatchOutcome::Posted(200, None),
-                    Err(reason) => DispatchOutcome::Posted(400, Some(reason)),
-                }
-            }
+            Route::Prompt
+            | Route::Answer
+            | Route::WindowInput
+            | Route::Stop
+            | Route::Command
+            | Route::PlanAction => match self.dispatch_post(route, session, body) {
+                Ok(()) => DispatchOutcome::Posted(200, None),
+                Err(reason) => DispatchOutcome::Posted(400, Some(reason)),
+            },
             Route::Highlight => {
                 let parsed: serde_json::Value = match serde_json::from_str(body) {
                     Ok(v) => v,
@@ -804,6 +809,25 @@ impl Dispatcher {
                 let (tx, rx) = flume::unbounded();
                 (crate::RemoteRequest::Stop { session, reply: tx }, rx)
             }
+            Route::PlanAction => {
+                let value: serde_json::Value =
+                    serde_json::from_str(body).map_err(|_| "invalid json".to_owned())?;
+                let action = required_str(&value, "action")?;
+                let parallel = value
+                    .get("parallel")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let (tx, rx) = flume::unbounded();
+                (
+                    crate::RemoteRequest::PlanAction {
+                        session,
+                        action,
+                        parallel,
+                        reply: tx,
+                    },
+                    rx,
+                )
+            }
             Route::Command => {
                 let value: serde_json::Value =
                     serde_json::from_str(body).map_err(|_| "invalid json".to_owned())?;
@@ -986,6 +1010,12 @@ impl SseSource {
                 RemoteUpdate::WindowClose { id, .. } => {
                     write_frame(&mut self.buf, "window_close", &json!({ "id": id }));
                 }
+                RemoteUpdate::Plan { frame, .. } => {
+                    write_frame(&mut self.buf, "plan", &plan_frame_json(&frame));
+                }
+                RemoteUpdate::PlanCleared { .. } => {
+                    write_frame(&mut self.buf, "plan_cleared", &json!({}));
+                }
             }
         }
         Some(std::mem::take(&mut self.buf))
@@ -1010,6 +1040,10 @@ fn frame_json(frame: &PermissionFrame) -> serde_json::Value {
         "tool": frame.tool,
         "scopes": frame.scopes,
     })
+}
+
+fn plan_frame_json(frame: &PlanFrame) -> serde_json::Value {
+    json!({ "path": frame.path })
 }
 
 #[cfg(test)]
@@ -1176,6 +1210,54 @@ mod tests {
             "{outcome:?}"
         );
         answerer.join().unwrap();
+    }
+
+    #[test]
+    fn plan_action_route_reaches_the_loop_with_its_body_parsed() {
+        assert_eq!(Route::from_tail("plan", "POST"), Some(Route::PlanAction));
+        let (tx, rx) = flume::unbounded();
+        let dispatcher = Dispatcher {
+            state: RemoteState::new(),
+            requests: tx,
+        };
+        let answerer = std::thread::spawn(move || {
+            let RemoteRequest::PlanAction {
+                action,
+                parallel,
+                reply,
+                ..
+            } = rx.recv().unwrap()
+            else {
+                panic!("a plan action is expected")
+            };
+            assert_eq!(action, "implement");
+            assert!(parallel);
+            let _ = reply.send(Ok(()));
+        });
+        let outcome = dispatcher.dispatch(
+            Some(Route::PlanAction),
+            None,
+            "",
+            r#"{"action":"implement","parallel":true}"#,
+            "anon·control",
+        );
+        assert!(
+            matches!(outcome, DispatchOutcome::Posted(200, None)),
+            "{outcome:?}"
+        );
+        answerer.join().unwrap();
+    }
+
+    #[test]
+    fn plan_action_defaults_parallel_to_false_and_rejects_missing_action() {
+        let dispatcher = dispatcher_for(RemoteState::new());
+        let DispatchOutcome::Posted(status, Some(reason)) =
+            dispatcher.dispatch(Some(Route::PlanAction), None, "", "{}", "anon·control")
+        else {
+            panic!("missing action is refused");
+        };
+        assert_eq!(status, 400);
+        assert!(reason.contains("action"), "{reason}");
     }
 
     #[test]

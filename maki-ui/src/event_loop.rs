@@ -886,6 +886,20 @@ impl<'t> EventLoop<'t> {
                     state.send_window_close(&session_id, id);
                 }
             }
+            if let Some(change) = rt.app.take_plan_change()
+                && let Some(state) = &state
+            {
+                let session_id = rt.id().to_string();
+                match change {
+                    Some(path) => state.send_plan(
+                        &session_id,
+                        maki_remote::PlanFrame {
+                            path: path.display().to_string(),
+                        },
+                    ),
+                    None => state.send_plan_cleared(&session_id),
+                }
+            }
         }
         dirty
     }
