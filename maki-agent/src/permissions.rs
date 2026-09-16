@@ -29,6 +29,11 @@ pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
 const TASK_TOOL: &str = "task";
 const BASH_TOOL: &str = "bash";
 
+/// Splits the ask id from the encoded answer on the answer channel. A control
+/// character cannot appear in a tool-use id, and the answer is the tail, so
+/// deny guidance holding one still round-trips.
+const ANSWER_ID_SEPARATOR: char = '\u{1f}';
+
 /// Words that open a block the bash plugin keeps as one scope. Their first
 /// token names no program, so wildcarding it would cover every command the
 /// block can hold. See [`generalize_bash_segment`].
@@ -223,6 +228,42 @@ impl PermissionAnswer {
             Self::DenyWithGuidance(g) => Some(g),
             _ => None,
         }
+    }
+}
+
+/// An answer together with the id of the ask it answers.
+///
+/// The name is what makes a late answer harmless. The answer channel is a
+/// queue with no receiver parked between turns, so an answer to a cancelled
+/// turn's ask can sit there until the next turn's first permission wait pops
+/// it. Untagged, that stale answer is applied to a different tool and scope,
+/// and an `allow_always_*` then installs a rule for something the user never
+/// saw. Tagged, the waiter can tell it apart and drop it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggedAnswer {
+    pub request_id: String,
+    pub answer: PermissionAnswer,
+}
+
+impl TaggedAnswer {
+    pub fn new(request_id: impl Into<String>, answer: PermissionAnswer) -> Self {
+        Self {
+            request_id: request_id.into(),
+            answer,
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        format!(
+            "{}{ANSWER_ID_SEPARATOR}{}",
+            self.request_id,
+            self.answer.encode()
+        )
+    }
+
+    pub fn decode(raw: &str) -> Option<Self> {
+        let (request_id, answer) = raw.split_once(ANSWER_ID_SEPARATOR)?;
+        Some(Self::new(request_id, PermissionAnswer::decode(answer)?))
     }
 }
 
@@ -691,21 +732,36 @@ impl PermissionManager {
             tool: t2.clone(),
             scopes: s2.clone(),
         });
-        let response = cancel.race(guard.recv_async()).await;
+        // Only the answer naming this ask may be applied. Anything else is a
+        // leftover from a cancelled or reassigned ask, so it is dropped and the
+        // wait continues: consuming it would approve or deny this tool on a
+        // decision the user made about another one.
+        let answer = loop {
+            let response = cancel.race(guard.recv_async()).await;
+            match response {
+                Ok(Ok(raw)) => match TaggedAnswer::decode(&raw) {
+                    Some(tagged) if tagged.request_id == request_id => break tagged.answer,
+                    tagged => warn!(
+                        tool = %tool,
+                        scope = %scope_display(),
+                        request_id,
+                        answered = tagged.map(|t| t.request_id).unwrap_or_default(),
+                        "discarding a permission answer that does not name this request"
+                    ),
+                },
+                Ok(Err(_)) => {
+                    drop(guard);
+                    warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
+                    return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+                }
+                Err(_) => {
+                    drop(guard);
+                    return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+                }
+            }
+        };
         drop(guard);
 
-        let answer = match response {
-            Ok(Ok(a)) => a,
-            Ok(Err(_)) => {
-                warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
-                return Err(deny(DECISION_SOURCE_USER_ABORT, None));
-            }
-            Err(_) => return Err(deny(DECISION_SOURCE_USER_ABORT, None)),
-        };
-
-        let Some(answer) = PermissionAnswer::decode(&answer) else {
-            return Err(deny(DECISION_SOURCE_USER_ABORT, None));
-        };
         self.apply_decision(&t2, &s2, &answer);
         let source = answer.decision_source();
         if answer.is_allow() {
@@ -902,6 +958,9 @@ mod tests {
     const MCP_ARGS: &str = "{\"q\":\"maki\"}";
     const READ_TOOL: &str = "read";
     const READ_SCOPE: &str = "/home/user/project/src/main.rs";
+    const TAGGED_REQUEST_ID: &str = "toolu_1";
+    /// Guidance is free text and may hold the separator itself.
+    const TAGGED_GUIDANCE: &str = "no\u{1f}way";
 
     const ALLOWED: &str = "allowed";
     const DENIED: &str = "denied";
@@ -1320,6 +1379,22 @@ mod tests {
         ] {
             assert_eq!(PermissionAnswer::decode(&a.encode()), Some(a));
         }
+    }
+
+    #[test_case(PermissionAnswer::AllowAlwaysProject ; "allow")]
+    #[test_case(PermissionAnswer::Deny ; "deny")]
+    #[test_case(PermissionAnswer::DenyWithGuidance(TAGGED_GUIDANCE.into()) ; "guidance_with_separator")]
+    fn tagged_answer_roundtrip(answer: PermissionAnswer) {
+        let tagged = TaggedAnswer::new(TAGGED_REQUEST_ID, answer);
+        assert_eq!(TaggedAnswer::decode(&tagged.encode()), Some(tagged));
+    }
+
+    #[test_case("" ; "empty")]
+    #[test_case("allow" ; "untagged_answer")]
+    #[test_case(TAGGED_REQUEST_ID ; "id_only")]
+    #[test_case("{\"json\": true}" ; "elicitation_result")]
+    fn untagged_payloads_never_decode_to_an_answer(raw: &str) {
+        assert_eq!(TaggedAnswer::decode(raw), None);
     }
 
     #[test]

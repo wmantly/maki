@@ -50,7 +50,7 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
         return Ok(Model::clone(&ctx.model));
     };
     let requested: ModelTier = tier_str.parse().map_err(|e: ModelError| e.to_string())?;
-    let effective = requested.min(ctx.model.tier);
+    let effective = requested.capped_at(ctx.model.tier);
     if effective == ctx.model.tier {
         return Ok(Model::clone(&ctx.model));
     }

@@ -15,7 +15,7 @@ use crate::{
     dialect,
 };
 
-use super::{KeyPool, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 
 static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "zai",
@@ -369,15 +369,13 @@ impl Provider for Zai {
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
             {
-                Err(AgentError::Api { status, message })
-                    if (status == 429 || status >= 500)
-                        && (message.contains("1113") || message.contains("nsufficien")) =>
+                Err(AgentError::Api {
+                    status, message, ..
+                }) if (status == 429 || status >= 500)
+                    && (message.contains("1113") || message.contains("nsufficien")) =>
                 {
                     warn!(status, "insufficient funds, bailing out");
-                    Err(AgentError::Api {
-                        status: 402,
-                        message,
-                    })
+                    Err(AgentError::api(402, message))
                 }
                 result => result,
             }
@@ -400,13 +398,12 @@ impl Provider for Zai {
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_bearer(&self.auth)))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Bearer,
+        ))
     }
 
     fn adjust_model(&self, model: &mut Model) {

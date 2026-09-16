@@ -120,7 +120,6 @@ pub(crate) enum PromptState {
 pub enum PermissionPrompt {
     Closed,
     Open {
-        #[allow(dead_code)]
         id: String,
         tool: ToolKey,
         scopes: Vec<String>,
@@ -180,6 +179,15 @@ impl PermissionPrompt {
     pub(crate) fn tool(&self) -> Option<&ToolKey> {
         match self {
             Self::Open { tool, .. } => Some(tool),
+            Self::Closed => None,
+        }
+    }
+
+    /// The ask the agent is parked on. Its answer has to name it, or the agent
+    /// refuses it as one meant for some other request.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Open { id, .. } => Some(id),
             Self::Closed => None,
         }
     }

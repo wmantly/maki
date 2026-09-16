@@ -29,6 +29,14 @@ pub(crate) const MAX_IMAGES: usize = 100;
 const MAX_RAW_BYTES: usize = 3 * 1024 * 1024;
 /// Decode-bomb guard: a tiny header can declare gigabytes of RGBA.
 const MAX_PIXELS: u64 = 50_000_000;
+/// How much base64 a header probe may look at. Every format a provider takes
+/// puts its dimensions in the first bytes, so this only has to cover what can
+/// sit in front of them: a JPEG carrying an EXIF thumbnail is the fat case, and
+/// the standard caps that block at 64KB.
+const HEADER_PREFIX: usize = 192 * 1024;
+/// Base64 turns four characters into three bytes, so a prefix that ends mid
+/// group would decode to nothing usable.
+const BASE64_GROUP: usize = 4;
 /// How often the long edge may halve before an image is given up on.
 const LOSSY_ATTEMPTS: u32 = 4;
 
@@ -65,6 +73,24 @@ fn probe(bytes: &[u8]) -> Result<(ImageFormat, u32, u32), String> {
         .into_dimensions()
         .map_err(|e| format!("cannot read image header: {e}"))?;
     Ok((format, width, height))
+}
+
+fn decode_base64(data: &[u8]) -> Result<Vec<u8>, String> {
+    STANDARD
+        .decode(data)
+        .map_err(|e| format!("bad base64: {e}"))
+}
+
+/// Dimensions off a bounded prefix, so the common case, an image that is
+/// already wire-safe, never decodes megabytes it then throws away. `None`
+/// means the prefix was not enough to tell, which some payloads make
+/// legitimate (a header past the cut, a format whose reader wants more), and
+/// the caller falls back to the whole payload rather than rejecting the image.
+/// Bytes rather than `str` slicing: a payload that is not even ASCII must come
+/// out as bad base64, not a panic on a char boundary.
+fn probe_prefix(data: &str) -> Option<(ImageFormat, u32, u32)> {
+    let end = data.len().min(HEADER_PREFIX) / BASE64_GROUP * BASE64_GROUP;
+    probe(&decode_base64(&data.as_bytes()[..end]).ok()?).ok()
 }
 
 fn fits(width: u32, height: u32, base64_len: usize) -> bool {
@@ -120,10 +146,16 @@ fn encode(img: &DynamicImage, media: ImageMediaType) -> Result<Vec<u8>, String> 
 /// Decode, judge, and if need be shrink and re-encode. Runs off the async
 /// executor, so it may take its time.
 fn decide(data: Arc<str>, declared: ImageMediaType) -> Result<Fix, String> {
-    let bytes = STANDARD
-        .decode(&*data)
-        .map_err(|e| format!("bad base64: {e}"))?;
-    let (format, width, height) = probe(&bytes)?;
+    let mut decoded = None;
+    let (format, width, height) = match probe_prefix(&data) {
+        Some(probed) => probed,
+        None => {
+            let bytes = decode_base64(data.as_bytes())?;
+            let probed = probe(&bytes)?;
+            decoded = Some(bytes);
+            probed
+        }
+    };
     if let Some(detected) = media_type(format)
         && fits(width, height, data.len())
     {
@@ -144,6 +176,12 @@ fn decide(data: Arc<str>, declared: ImageMediaType) -> Result<Fix, String> {
     if u64::from(width) * u64::from(height) > MAX_PIXELS {
         return Err(format!("image too large to decode ({width}x{height})"));
     }
+    // Only a repair needs the pixels, and the guard above has already cleared
+    // them for decoding.
+    let bytes = match decoded {
+        Some(bytes) => bytes,
+        None => decode_base64(data.as_bytes())?,
+    };
     let mut img = image::load_from_memory_with_format(&bytes, format)
         .map_err(|e| format!("cannot decode: {e}"))?;
 
@@ -229,9 +267,16 @@ mod tests {
     const NOT_AN_IMAGE: &str = "abc123";
     /// Not base64, and not even ASCII.
     const NOT_TEXT: &str = "€€";
+    /// Base64 for less than one group, which decodes to nothing at all.
+    const SHORTER_THAN_A_GROUP: &str = "AA";
     /// Incompressible pixels: PNG cannot get this under the byte cap at the
     /// full edge, so the plan has to reach for the lossy encoder.
     const NOISE_HEIGHT: u32 = 800;
+    /// A PNG signature and the IHDR chunk behind it, in base64 characters.
+    const PNG_HEADER_CHARS: usize = 64;
+    /// JPEG puts its quantisation tables in front of the frame header that
+    /// carries the dimensions, so a prefix has to clear those too.
+    const JPEG_HEADER_CHARS: usize = 4096;
 
     fn png(width: u32, height: u32) -> ImageSource {
         ImageSource::new(ImageMediaType::Png, Arc::from(png_base64(width, height)))
@@ -316,5 +361,34 @@ mod tests {
         let first = rewrite(&source);
         assert!(Arc::ptr_eq(&rewrite(&source).data, &first.data));
         assert!(Arc::ptr_eq(&rewrite(&source.clone()).data, &first.data));
+    }
+
+    /// Truncating the payload to a header proves the megabytes behind it are
+    /// never decoded to answer the question every turn asks: does this fit.
+    #[test_case(noise_png(), PNG_HEADER_CHARS, ImageFormat::Png ; "png_signature_and_ihdr")]
+    #[test_case(rewrite(&noise_png()), JPEG_HEADER_CHARS, ImageFormat::Jpeg ; "jpeg_up_to_its_frame_header")]
+    fn dimensions_are_read_from_a_prefix_of_the_payload(
+        source: ImageSource,
+        chars: usize,
+        format: ImageFormat,
+    ) {
+        assert!(
+            source.data.len() > chars,
+            "the prefix must be a fraction of the payload"
+        );
+        assert_eq!(
+            probe_prefix(&source.data[..chars]),
+            Some((format, MAX_EDGE, NOISE_HEIGHT))
+        );
+    }
+
+    /// A prefix a reader cannot make sense of is not a verdict, so probing
+    /// gives up and leaves the caller to decode the whole payload. Slicing a
+    /// payload that is not base64, or shorter than one group, must not panic.
+    #[test_case(NOT_AN_IMAGE ; "not_an_image")]
+    #[test_case(NOT_TEXT ; "not_even_text")]
+    #[test_case(SHORTER_THAN_A_GROUP ; "shorter_than_one_base64_group")]
+    fn an_unreadable_prefix_gives_up_rather_than_panicking(data: &str) {
+        assert!(probe_prefix(data).is_none());
     }
 }

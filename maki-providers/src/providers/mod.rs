@@ -15,6 +15,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
 
 use crate::AgentError;
+use crate::retry::RetryPolicy;
 
 pub(crate) mod anthropic;
 pub(crate) mod aperture;
@@ -42,6 +43,7 @@ pub(crate) mod zai;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
+const EMPTY_SSE_ERROR_MESSAGE: &str = "provider sent an error frame with no detail";
 const UNAUTHORIZED_STATUS: u16 = 401;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
@@ -64,6 +66,7 @@ pub struct Timeouts {
     pub connect: Duration,
     pub stream: Duration,
     pub low_speed: Duration,
+    pub retry: RetryPolicy,
 }
 
 impl Default for Timeouts {
@@ -72,6 +75,18 @@ impl Default for Timeouts {
             connect: Duration::from_secs(10),
             stream: Duration::from_secs(300),
             low_speed: Duration::from_secs(30),
+            retry: RetryPolicy::default(),
+        }
+    }
+}
+
+impl From<&maki_config::ProviderConfig> for Timeouts {
+    fn from(config: &maki_config::ProviderConfig) -> Self {
+        Self {
+            connect: config.connect_timeout,
+            stream: config.stream_timeout,
+            low_speed: config.low_speed_timeout,
+            retry: config.into(),
         }
     }
 }
@@ -94,9 +109,11 @@ pub(crate) fn refreshed_tokens(
     refresh: impl FnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
 ) -> Result<OAuthTokens, AgentError> {
     let _lock = lock_tokens(dir, provider);
-    let current = load_tokens(dir, provider).ok_or_else(|| AgentError::Api {
-        status: UNAUTHORIZED_STATUS,
-        message: format!("{provider} OAuth tokens not found on disk"),
+    let current = load_tokens(dir, provider).ok_or_else(|| {
+        AgentError::api(
+            UNAUTHORIZED_STATUS,
+            format!("{provider} OAuth tokens not found on disk"),
+        )
     })?;
     if rejected.is_none_or(|stale| current.access != stale) && !current.is_expired() {
         return Ok(current);
@@ -261,14 +278,16 @@ pub(crate) struct SseErrorPayload {
     pub error: SseErrorDetail,
 }
 
+/// Every field is optional because rejecting any one shape throws away the whole error, and a
+/// half-filled error frame still tells us an outage happened. `code` in particular arrives as a
+/// string, a number or `null` depending on the provider.
 #[derive(Deserialize)]
 pub(crate) struct SseErrorDetail {
     #[serde(default)]
     pub r#type: String,
-    /// Providers send this as a string, a number or `null`, and rejecting any one of those shapes
-    /// throws away the whole error.
     #[serde(default)]
     pub code: Value,
+    #[serde(default)]
     pub message: String,
     #[serde(default)]
     pub metadata: Option<SseErrorMetadata>,
@@ -322,10 +341,10 @@ impl SseErrorPayload {
                     .and_then(|m| sse_error_status(&m.error_type))
             })
             .unwrap_or(UNMAPPED_SSE_ERROR_STATUS);
-        AgentError::Api {
-            status,
-            message: self.error.message,
+        if self.error.message.trim().is_empty() {
+            return AgentError::api(status, EMPTY_SSE_ERROR_MESSAGE);
         }
+        AgentError::api(status, self.error.message)
     }
 }
 
@@ -421,7 +440,9 @@ impl KeyPool {
             .and_then(|d| d.api_key.clone())
     }
 
-    pub(crate) fn from_keys(keys: Vec<String>) -> Self {
+    /// For callers that already hold the keys, rather than a source to resolve
+    /// them from.
+    pub fn from_keys(keys: Vec<String>) -> Self {
         Self {
             keys: Arc::new(keys),
             index: Arc::new(AtomicUsize::new(0)),
@@ -440,29 +461,67 @@ impl KeyPool {
         true
     }
 
-    /// Rotate to the next key and refresh only the header carrying it, so the
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+}
+
+/// Where a provider's key lands in its auth headers. Two shapes cover every
+/// provider we have, and an enum keeps "how a key becomes a header" in one
+/// place instead of one closure per provider.
+#[derive(Clone, Copy)]
+pub enum KeyHeader {
+    /// `Authorization: Bearer <key>`.
+    Bearer,
+    /// The key verbatim, in a provider specific header (`x-api-key`,
+    /// `x-goog-api-key`).
+    Raw(&'static str),
+}
+
+impl KeyHeader {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Bearer => AUTHORIZATION_HEADER,
+            Self::Raw(name) => name,
+        }
+    }
+
+    fn value(self, key: &str) -> String {
+        match self {
+            Self::Bearer => bearer_value(key),
+            Self::Raw(_) => key.to_string(),
+        }
+    }
+}
+
+/// A provider's keys and the auth they are written into.
+pub struct KeyRotation<'a> {
+    pool: &'a KeyPool,
+    auth: &'a Mutex<ResolvedAuth>,
+    header: KeyHeader,
+}
+
+impl<'a> KeyRotation<'a> {
+    pub fn new(pool: &'a KeyPool, auth: &'a Mutex<ResolvedAuth>, header: KeyHeader) -> Self {
+        Self { pool, auth, header }
+    }
+
+    /// How many keys a walk can try before it is back where it started.
+    pub fn key_count(&self) -> usize {
+        self.pool.len()
+    }
+
+    /// Advance to the next key and refresh only the header carrying it, so the
     /// resolved `base_url` and any `[<slug>.headers]` survive the rotation.
-    pub fn rotate_key_header(
-        &self,
-        auth: &Mutex<ResolvedAuth>,
-        name: &str,
-        build: impl FnOnce(&str) -> String,
-    ) -> bool {
-        if !self.rotate() {
+    pub fn rotate(&self) -> bool {
+        if !self.pool.rotate() {
             return false;
         }
-        auth.lock()
+        self.auth
+            .lock()
             .unwrap()
-            .set_key_header(name, build(self.current()));
+            .set_key_header(self.header.name(), self.header.value(self.pool.current()));
         true
-    }
-
-    pub fn rotate_bearer(&self, auth: &Mutex<ResolvedAuth>) -> bool {
-        self.rotate_key_header(auth, AUTHORIZATION_HEADER, bearer_value)
-    }
-
-    pub fn len(&self) -> usize {
-        self.keys.len()
     }
 }
 
@@ -477,6 +536,8 @@ mod tests {
 
     const ERROR_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const PARSE_FAILED: &str = "SSE error payload should deserialize";
+    const UNAVAILABLE_STATUS: u16 = 502;
+    const UNAVAILABLE_TAG: &str = "provider_unavailable";
     const TEST_PROVIDER: &str = "openai";
     const ON_DISK: &str = "on-disk-access";
     const FRESH: &str = "fresh-access";
@@ -548,6 +609,31 @@ mod tests {
             format!("API error ({status}): {ERROR_MESSAGE}")
         );
         assert_eq!(err.is_retryable(), retryable);
+    }
+
+    // A frame that only says "the upstream is down" must survive parsing, or the turn ends with an
+    // empty assistant message and no retry.
+    #[test_case(Some(ERROR_MESSAGE), ERROR_MESSAGE           ; "message_present")]
+    #[test_case(None,                EMPTY_SSE_ERROR_MESSAGE ; "message_key_absent")]
+    #[test_case(Some(""),            EMPTY_SSE_ERROR_MESSAGE ; "message_empty")]
+    #[test_case(Some("   "),         EMPTY_SSE_ERROR_MESSAGE ; "message_blank")]
+    fn sse_error_payload_without_message_still_classifies(message: Option<&str>, expected: &str) {
+        let mut error = serde_json::json!({
+            "code": UNAVAILABLE_STATUS,
+            "metadata": { "error_type": UNAVAILABLE_TAG },
+        });
+        if let Some(message) = message {
+            error["message"] = message.into();
+        }
+        let payload: SseErrorPayload =
+            serde_json::from_value(serde_json::json!({ "error": error })).expect(PARSE_FAILED);
+        let err = payload.into_agent_error();
+
+        assert_eq!(
+            err.to_string(),
+            format!("API error ({UNAVAILABLE_STATUS}): {expected}")
+        );
+        assert!(err.is_retryable());
     }
 
     #[test_case("a b", "a%20b" ; "space")]
@@ -719,22 +805,33 @@ mod tests {
         assert!(msg.contains(&var), "got: {msg}");
     }
 
+    const KEY_1: &str = "sk-1";
+    const KEY_2: &str = "sk-2";
+    const SECOND_BEARER: &str = "Bearer sk-2";
+    const RAW_KEY_HEADER: &str = "x-api-key";
+    const TRACE_HEADER: &str = "x-trace";
+    const TRACE_ID: &str = "trace-1";
+
+    fn two_key_pool() -> KeyPool {
+        KeyPool::from_keys(vec![KEY_1.into(), KEY_2.into()])
+    }
+
     #[test]
-    fn rotate_bearer_keeps_base_url_and_config_headers() {
-        let pool = KeyPool::from_keys(vec!["sk-1".into(), "sk-2".into()]);
+    fn rotate_keeps_base_url_and_config_headers() {
+        let pool = two_key_pool();
         let mut auth = test_bearer(pool.current());
         auth.base_url = Some(GATEWAY_URL.into());
         auth.apply_config_headers(TEST_SLUG, &config_headers(&[(GATEWAY_HEADER, GATEWAY_ID)]))
             .unwrap();
 
         let auth = Mutex::new(auth);
-        assert!(pool.rotate_bearer(&auth));
+        assert!(KeyRotation::new(&pool, &auth, KeyHeader::Bearer).rotate());
 
         let auth = auth.lock().unwrap();
         assert_eq!(auth.base_url.as_deref(), Some(GATEWAY_URL));
         assert_eq!(
             header_value(&auth, AUTHORIZATION_HEADER).as_deref(),
-            Some("Bearer sk-2")
+            Some(SECOND_BEARER)
         );
         assert_eq!(
             header_value(&auth, GATEWAY_HEADER).as_deref(),
@@ -743,8 +840,8 @@ mod tests {
     }
 
     #[test]
-    fn rotate_bearer_keeps_a_configured_auth_header() {
-        let pool = KeyPool::from_keys(vec!["sk-1".into(), "sk-2".into()]);
+    fn rotate_keeps_a_configured_auth_header() {
+        let pool = two_key_pool();
         let mut auth = test_bearer(pool.current());
         auth.apply_config_headers(
             TEST_SLUG,
@@ -753,7 +850,7 @@ mod tests {
         .unwrap();
 
         let auth = Mutex::new(auth);
-        assert!(pool.rotate_bearer(&auth));
+        assert!(KeyRotation::new(&pool, &auth, KeyHeader::Bearer).rotate());
 
         // The gateway credential replaced the built-in bearer, so rotating the
         // key must not put `Bearer sk-2` back and lock the user out.
@@ -763,5 +860,38 @@ mod tests {
             header_value(&auth, AUTHORIZATION_HEADER).as_deref(),
             Some(GATEWAY_CRED)
         );
+    }
+
+    #[test_case(KeyHeader::Bearer, AUTHORIZATION_HEADER, SECOND_BEARER ; "bearer")]
+    #[test_case(KeyHeader::Raw(RAW_KEY_HEADER), RAW_KEY_HEADER, KEY_2  ; "raw")]
+    fn rotate_advances_the_key_and_rewrites_only_its_header(
+        header: KeyHeader,
+        name: &str,
+        expected: &str,
+    ) {
+        let pool = two_key_pool();
+        let auth = Mutex::new(ResolvedAuth::for_test(
+            None,
+            vec![
+                (name.into(), header.value(pool.current())),
+                (TRACE_HEADER.into(), TRACE_ID.into()),
+            ],
+        ));
+
+        assert!(KeyRotation::new(&pool, &auth, header).rotate());
+
+        assert_eq!(pool.current(), KEY_2);
+        let auth = auth.lock().unwrap();
+        assert_eq!(header_value(&auth, name).as_deref(), Some(expected));
+        assert_eq!(header_value(&auth, TRACE_HEADER).as_deref(), Some(TRACE_ID));
+    }
+
+    #[test]
+    fn a_single_key_pool_has_nowhere_to_rotate_to() {
+        let pool = KeyPool::from_keys(vec![KEY_1.into()]);
+        let auth = Mutex::new(test_bearer(KEY_1));
+
+        assert!(!KeyRotation::new(&pool, &auth, KeyHeader::Bearer).rotate());
+        assert_eq!(pool.current(), KEY_1);
     }
 }

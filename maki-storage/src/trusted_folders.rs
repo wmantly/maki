@@ -16,6 +16,10 @@ const OLDEST_SUPPORTED_VERSION: u32 = 1;
 const LOCK_FILE: &str = "trusted-folders.lock";
 /// Lives next to the session index on purpose, see [`TrustedFolders::grandfathered_roots`].
 const PRE_TRUST_FILE: &str = "pre-trust-roots.json";
+/// The answer a damaged snapshot is settled as: no project root predates folder
+/// trust. It is a real, parseable answer, so writing it retires the one-time
+/// migration question for good, see [`TrustedFolders::grandfathered_roots`].
+const EMPTY_SNAPSHOT: &[u8] = b"[]";
 /// How many recorded working directories the snapshot is willing to resolve.
 /// Resolving one costs a realpath per path component and a stat per ancestor,
 /// and this runs on the first start after an upgrade, on the same thread ACP
@@ -266,6 +270,13 @@ impl TrustedFolders {
     /// Whatever ends up on disk is what this run uses, never the set it just
     /// computed, so a run only ever trusts a snapshot that is durable and that
     /// every later run will read the same way.
+    ///
+    /// A snapshot that cannot be parsed grandfathers nothing, here and on every
+    /// later start, because it is replaced with an explicitly empty one rather
+    /// than taken again. Taking it again would answer the migration question a
+    /// second time against a session index that has moved on, and by then it
+    /// holds the working directory of every run that was just refused. If the
+    /// replacement cannot be written, this run still grandfathers nothing.
     fn grandfathered_roots(&self, project_root: ProjectRootOf) -> Vec<String> {
         let path = self.sessions_dir.join(PRE_TRUST_FILE);
         if !path.exists()
@@ -284,16 +295,10 @@ impl TrustedFolders {
         };
         match serde_json::from_slice(&frozen) {
             Ok(roots) => roots,
-            // An empty snapshot is a real answer, a broken one is not, so a
-            // file nobody can parse must not sit there answering "nothing" for
-            // the rest of this install's life. Grandfathering stays off for
-            // this run and the next start takes the snapshot again. Taking it
-            // again right here would race a start that has claimed the path
-            // and is about to fill it.
             Err(error) => {
-                tracing::warn!(%error, path = %path.display(), "the record of folders that predate folder trust is damaged, taking it again on the next start");
-                if let Err(error) = fs::remove_file(&path) {
-                    tracing::warn!(%error, path = %path.display(), "cannot clear the damaged record of folders that predate folder trust");
+                tracing::warn!(%error, path = %path.display(), "the record of folders that predate folder trust is damaged, nothing is grandfathered from now on");
+                if let Err(error) = atomic_write(&path, EMPTY_SNAPSHOT) {
+                    tracing::warn!(%error, path = %path.display(), "cannot settle the damaged record of folders that predate folder trust");
                 }
                 Vec::new()
             }
@@ -311,7 +316,10 @@ impl TrustedFolders {
     /// so two starts racing here cannot freeze two different sets: the loser
     /// stops and reads what the winner wrote. The content then arrives through
     /// `atomic_write`, because a half-written snapshot would be read as an
-    /// answer by every later start.
+    /// answer by every later start. A crash in the gap between the claim and
+    /// the write leaves an empty file, which nobody can parse and which
+    /// [`TrustedFolders::grandfathered_roots`] therefore settles as "nothing
+    /// predates folder trust" rather than freezing a second, later set.
     fn freeze_pre_trust_roots(
         &self,
         path: &Path,
@@ -956,11 +964,13 @@ mod tests {
     }
 
     /// A snapshot left half written by an older Maki, or by a disk that filled
-    /// up mid write, used to answer "nothing predates folder trust" for good.
-    /// It is cleared instead, so the next start writes a whole one.
+    /// up mid write, must not be taken again: by then the session index holds
+    /// the working directory of every run that was refused, so a second freeze
+    /// would hand a folder the user said no to a silent yes. The migration
+    /// question is answered once, and a damaged answer settles as "nothing".
     #[test_case("" ; "empty_from_a_crash_between_create_and_write")]
     #[test_case("[\"/wo" ; "truncated_json")]
-    fn a_damaged_snapshot_is_taken_again_rather_than_believed(damaged: &str) {
+    fn a_damaged_snapshot_grandfathers_nothing_for_good(damaged: &str) {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         let used_before = checkout(&dir, "used-before");
@@ -975,19 +985,29 @@ mod tests {
             TrustDecision::Unknown,
             "a snapshot nobody can read must grandfather nothing"
         );
-        assert!(!snapshot.exists(), "the damaged snapshot must be cleared");
-
-        assert_eq!(
-            store
-                .decide(&used_before, &[INIT_LUA], &checkout_root)
-                .unwrap(),
-            TrustDecision::Grandfathered,
-            "the next start takes the snapshot again"
-        );
         assert_eq!(
             serde_json::from_slice::<Vec<String>>(&fs::read(&snapshot).unwrap()).unwrap(),
-            vec![used_before.as_str().to_owned()]
+            Vec::<String>::new(),
+            "the damaged snapshot must be settled as an explicit empty answer"
         );
+
+        let refused = checkout(&dir, "refused");
+        record_session(&dir, refused.path());
+
+        for _ in 0..2 {
+            assert_eq!(
+                store
+                    .decide(&used_before, &[INIT_LUA], &checkout_root)
+                    .unwrap(),
+                TrustDecision::Unknown,
+                "every later start reads the same empty answer"
+            );
+            assert_eq!(
+                store.decide(&refused, &[INIT_LUA], &checkout_root).unwrap(),
+                TrustDecision::Unknown,
+                "a folder recorded after the damage must never be grandfathered"
+            );
+        }
     }
 
     /// Nobody has session history on a first install, so the snapshot is empty

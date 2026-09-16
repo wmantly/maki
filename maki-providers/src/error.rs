@@ -1,10 +1,18 @@
 //! Provider error types with retry semantics.
 //! Retryable: 429, 5xx, IO, HTTP transport. Non-retryable: other 4xx, JSON parse, config,
-//! channel closed, user cancel. `user_message()` returns human-readable text for each variant.
+//! channel closed, user cancel. `retry_kind()` says which budget a retry draws
+//! from, so a connection that was never made can stop while a connection that
+//! dropped is waited out. `user_message()` returns human-readable text for each
+//! variant.
 
-use isahc::AsyncReadResponseExt;
+use std::{io, time::Duration};
 
-use crate::providers::opencode::{self, NonLoginError};
+use isahc::{AsyncReadResponseExt, error::ErrorKind as HttpErrorKind};
+
+use crate::{
+    providers::opencode::{self, NonLoginError},
+    retry::RetryKind,
+};
 
 /// Request fields that cap the *output*. A 400 naming one of them is about the
 /// cap we sent, never about the prompt being too big.
@@ -14,6 +22,9 @@ const OUTPUT_CAP_FIELDS: [&str; 3] = ["max_tokens", "max_completion_tokens", "ma
 const MESSAGES_HALF: &str = " in the messages";
 const COMPLETION_HALF: &str = " in the completion";
 const OPENAI_LIMIT: &str = "maximum context length is ";
+const CONNECT_FAILED_MESSAGE: &str =
+    "could not connect, check the server is running and the base URL is correct";
+const NETWORK_ERROR_MESSAGE: &str = "connection error, check your network";
 
 /// Why a provider refused a request for size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +96,12 @@ fn budget_overflow(m: &str) -> Option<Overflow> {
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error("API error ({status}): {message}")]
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        message: String,
+        /// What the server's `Retry-After` header asked for, when it sent one.
+        retry_after: Option<Duration>,
+    },
     #[error("{message}")]
     Config { message: String },
     #[error("tool error in {tool}: {message}")]
@@ -109,21 +125,43 @@ pub enum AgentError {
 }
 
 impl AgentError {
-    pub fn is_retryable(&self) -> bool {
+    /// An API error with no `Retry-After` behind it. Everything that is not a
+    /// response we read the headers of lands here, SSE error frames included.
+    pub fn api(status: u16, message: impl Into<String>) -> Self {
+        Self::Api {
+            status,
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    /// Which budget trying again would draw from, or `None` when trying again
+    /// is pointless. The kinds are priced differently, so the retry loop needs
+    /// more than a yes or no.
+    pub fn retry_kind(&self) -> Option<RetryKind> {
         if self.is_context_overflow() || self.is_quota_exhausted() {
-            return false;
+            return None;
         }
         match self {
-            Self::Api { status, .. } => *status == 429 || *status >= 500,
-            Self::Io(_) | Self::Http(_) | Self::Timeout { .. } => true,
-            Self::Config { .. }
+            Self::Api { status: 429, .. } => Some(RetryKind::RateLimit),
+            Self::Api { status, .. } if *status >= 500 => Some(RetryKind::Transient),
+            Self::Http(e) if is_connect_failure(e) => Some(RetryKind::Connect),
+            Self::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused => Some(RetryKind::Connect),
+            Self::Io(_) | Self::Http(_) => Some(RetryKind::Transient),
+            Self::Timeout { .. } => Some(RetryKind::Timeout),
+            Self::Api { .. }
+            | Self::Config { .. }
             | Self::Tool { .. }
             | Self::Channel
             | Self::Json(_)
             | Self::Cancelled
             | Self::EmptySummary
-            | Self::HttpRequest(_) => false,
+            | Self::HttpRequest(_) => None,
         }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.retry_kind().is_some()
     }
 
     /// Refused for size, either cause.
@@ -160,7 +198,10 @@ impl AgentError {
     ///   already does every other provider's real overflow error, instead of
     ///   surfacing a confusing dead end. <https://github.com/tontinton/maki/issues/935>
     pub fn overflow(&self) -> Option<Overflow> {
-        let Self::Api { status, message } = self else {
+        let Self::Api {
+            status, message, ..
+        } = self
+        else {
             return None;
         };
         if !matches!(status, 400 | 413) {
@@ -207,7 +248,10 @@ impl AgentError {
     /// OpenCode serves billing and plan failures on the statuses we otherwise
     /// read as a stale token, and only that provider knows its error types.
     fn non_login_error(&self) -> Option<NonLoginError> {
-        let Self::Api { status, message } = self else {
+        let Self::Api {
+            status, message, ..
+        } = self
+        else {
             return None;
         };
         opencode::non_login_error(*status, message)
@@ -219,8 +263,13 @@ impl AgentError {
         self.non_login_error().is_some_and(|error| error.is_quota)
     }
 
+    /// Whether *this key* is the problem rather than the account, which is a
+    /// different question from whether the request is worth retrying: the retry
+    /// loop asks it for every error, since a 401 or a 403 is dead for this key
+    /// and fine for the next one.
     pub fn should_rotate_key(&self) -> bool {
-        // A plan quota is per-account, so the user's other keys are just as spent.
+        // A plan quota is per-account, so the other keys are just as spent and
+        // walking the pool only burns them in turn.
         !self.is_quota_exhausted()
             && matches!(self, Self::Api { status, .. } if *status == 429 || *status == 401 || *status == 403)
     }
@@ -237,10 +286,16 @@ impl AgentError {
             Self::Api { status: 401, .. } => {
                 "authentication failed, run `maki auth login` or check your API key".into()
             }
-            Self::Api { status, message } => format!("API error ({status}): {message}"),
+            Self::Api {
+                status, message, ..
+            } => format!("API error ({status}): {message}"),
             Self::Tool { tool, message } => format!("{tool}: {message}"),
+            Self::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                CONNECT_FAILED_MESSAGE.into()
+            }
             Self::Io(e) => format!("I/O error: {e}"),
-            Self::Http(_) => "connection error, check your network".into(),
+            Self::Http(e) if is_connect_failure(e) => CONNECT_FAILED_MESSAGE.into(),
+            Self::Http(_) => NETWORK_ERROR_MESSAGE.into(),
             Self::Timeout { .. } => "stream timed out, retrying".into(),
             Self::HttpRequest(e) => format!("request error: {e}"),
             Self::Json(_) => "received an invalid response from the API".into(),
@@ -252,11 +307,31 @@ impl AgentError {
 
     pub async fn from_response(mut response: isahc::Response<isahc::AsyncBody>) -> Self {
         let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after);
         let message = response
             .text()
             .await
             .unwrap_or_else(|_| "unable to read error body".into());
-        Self::Api { status, message }
+        Self::Api {
+            status,
+            message,
+            retry_after,
+        }
+    }
+
+    /// How long the server asked us to wait, when it bothered to say. Always a
+    /// positive duration: only [`Self::from_response`] ever reads headers, and
+    /// an error built any other way answers `None` and the caller falls back on
+    /// its own backoff.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Api { retry_after, .. } => *retry_after,
+            _ => None,
+        }
     }
 
     pub fn retry_message(&self) -> String {
@@ -285,38 +360,70 @@ impl From<maki_storage::StorageError> for AgentError {
         match e {
             maki_storage::StorageError::Io(io) => Self::Io(io),
             maki_storage::StorageError::Json(j) => Self::Json(j),
-            other => Self::Api {
-                status: 0,
-                message: other.to_string(),
-            },
+            other => Self::api(0, other.to_string()),
         }
+    }
+}
+
+/// Nothing answered at the other end, either because no socket is listening or
+/// because the host name does not resolve. isahc folds a refused connection and
+/// a dead provider edge into the same `ConnectionFailed`, and telling them
+/// apart is not possible from here.
+///
+/// `ErrorKind::Timeout` stays out: it covers both an expired connect timeout
+/// and a stall on a stream that was already flowing, which want opposite
+/// budgets, and the error alone cannot say which happened. So it retries as
+/// [`RetryKind::Transient`], unbounded, and a blackholed SYN keeps trying where
+/// a refused port gives up in seconds. Splitting the two means tracking whether
+/// any byte ever arrived.
+fn is_connect_failure(e: &isahc::Error) -> bool {
+    matches!(
+        e.kind(),
+        HttpErrorKind::ConnectionFailed | HttpErrorKind::NameResolution
+    )
+}
+
+/// Only the delta-seconds form ("30", "60"). The HTTP-date form is legal but
+/// providers do not send it, and guessing a backoff beats parsing dates.
+///
+/// `0` is not a hint. Anthropic's own usage endpoint answers a persistent 429
+/// with `Retry-After: 0`, and sleeping for zero seconds before asking the same
+/// rate limiter again is a tight loop, not a backoff.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    match value.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Some(Duration::from_secs(secs)),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use maki_config::DEFAULT_MAX_RETRIES;
     use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::*;
-    use crate::providers::opencode::{NON_LOGIN_FALLBACK_MESSAGE, QUOTA_FALLBACK_MESSAGE};
+    use crate::{
+        providers::opencode::{NON_LOGIN_FALLBACK_MESSAGE, QUOTA_FALLBACK_MESSAGE},
+        retry::{RetryPolicy, RetryState},
+    };
 
     const QUOTA_MESSAGE: &str = "Weekly usage limit reached. Resets in 3 hours.";
     const MODEL_MESSAGE: &str = "Your trial has ended.";
     const RATE_LIMITED_RETRY_MESSAGE: &str = "Rate limited";
+    /// More rounds than any bounded budget allows, so a budget that survives
+    /// all of them is the unbounded one.
+    const ROUNDS: u32 = DEFAULT_MAX_RETRIES * 2;
+    /// Retry budgets are what these tests measure, so the key walk must not add
+    /// attempts of its own.
+    const ONE_KEY: usize = 1;
 
     fn api(status: u16) -> AgentError {
-        AgentError::Api {
-            status,
-            message: String::new(),
-        }
+        AgentError::api(status, "")
     }
 
     fn api_msg(status: u16, message: &str) -> AgentError {
-        AgentError::Api {
-            status,
-            message: message.into(),
-        }
+        AgentError::api(status, message)
     }
 
     fn opencode_body(error_type: &str, message: &str) -> String {
@@ -415,16 +522,68 @@ mod tests {
     #[test_case(401, "authentication failed, run `maki auth login` or check your API key" ; "user_msg_401")]
     #[test_case(400, "API error (400): bad input"                                         ; "user_msg_400")]
     fn user_message_api(status: u16, expected: &str) {
-        let err = AgentError::Api {
-            status,
-            message: "bad input".into(),
-        };
+        let err = AgentError::api(status, "bad input");
         assert_eq!(err.user_message(), expected);
     }
 
+    #[test_case(429, RetryKind::RateLimit ; "rate_limit")]
+    #[test_case(500, RetryKind::Transient  ; "server_error")]
+    #[test_case(529, RetryKind::Transient  ; "overloaded")]
+    fn api_retry_kind(status: u16, expected: RetryKind) {
+        assert_eq!(api(status).retry_kind(), Some(expected));
+    }
+
     #[test]
-    fn timeout_is_retryable() {
-        assert!(AgentError::Timeout { secs: 30 }.is_retryable());
+    fn a_timeout_is_its_own_kind() {
+        assert_eq!(
+            AgentError::Timeout { secs: 30 }.retry_kind(),
+            Some(RetryKind::Timeout)
+        );
+    }
+
+    /// Retries this error is granted before the loop has to give up, stopping
+    /// at `ROUNDS` for a budget with no ceiling.
+    fn retries_granted(error: &AgentError) -> u32 {
+        let kind = error.retry_kind().expect("a transport failure retries");
+        let mut state = RetryState::new(RetryPolicy::default(), ONE_KEY);
+        (0..ROUNDS)
+            .take_while(|_| state.next_delay(kind, error.retry_after()).is_some())
+            .count() as u32
+    }
+
+    /// A dead provider edge and a local server nobody started both land in
+    /// `ConnectionFailed`, so the run has to give up on it, while a failure on
+    /// a connection that was made is the network being the network and is
+    /// waited out.
+    #[test_case(HttpErrorKind::ConnectionFailed, DEFAULT_MAX_RETRIES ; "a_refused_connection_gives_up")]
+    #[test_case(HttpErrorKind::NameResolution, DEFAULT_MAX_RETRIES   ; "an_unresolvable_host_gives_up")]
+    #[test_case(HttpErrorKind::Io, ROUNDS                            ; "a_read_error_keeps_retrying")]
+    #[test_case(HttpErrorKind::TlsEngine, ROUNDS                     ; "a_tls_failure_keeps_retrying")]
+    fn a_transport_failure_is_waited_out_only_once_connected(kind: HttpErrorKind, expected: u32) {
+        assert_eq!(retries_granted(&AgentError::Http(kind.into())), expected);
+    }
+
+    #[test_case(io::ErrorKind::ConnectionRefused, DEFAULT_MAX_RETRIES ; "a_refused_socket_gives_up")]
+    #[test_case(io::ErrorKind::UnexpectedEof, ROUNDS                  ; "a_truncated_read_keeps_retrying")]
+    fn an_io_failure_gives_up_when_nothing_is_listening(kind: io::ErrorKind, expected: u32) {
+        assert_eq!(retries_granted(&AgentError::Io(kind.into())), expected);
+    }
+
+    #[test_case(HttpErrorKind::ConnectionFailed, CONNECT_FAILED_MESSAGE ; "connect_failure_names_the_server")]
+    #[test_case(HttpErrorKind::TlsEngine, NETWORK_ERROR_MESSAGE         ; "other_transport_blames_the_network")]
+    fn user_message_transport(kind: HttpErrorKind, expected: &str) {
+        assert_eq!(AgentError::Http(kind.into()).user_message(), expected);
+    }
+
+    #[test_case("30", Some(Duration::from_secs(30)) ; "delta_seconds")]
+    #[test_case(" 5 ", Some(Duration::from_secs(5))  ; "whitespace")]
+    #[test_case("Wed, 21 Oct 2015 07:28:00 GMT", None ; "http_date")]
+    #[test_case("", None                             ; "empty")]
+    #[test_case("-3", None                           ; "negative")]
+    // A zero would be slept on and come straight back with the same 429.
+    #[test_case("0", None                            ; "zero")]
+    fn retry_after_header_is_read_as_seconds(value: &str, expected: Option<Duration>) {
+        assert_eq!(parse_retry_after(value), expected);
     }
 
     // llama.cpp: https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-context.cpp

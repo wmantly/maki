@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use maki_providers::provider::Provider;
-use maki_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
+use maki_providers::retry::{RetryPolicy, RetryState};
 use maki_providers::{
     ContentBlock, ContextGauge, Message, Model, Overflow, ProviderEvent, RequestOptions,
     StreamResponse, estimate_prompt_tokens,
@@ -22,6 +22,11 @@ const MIN_OUTPUT_TOKENS: u32 = 4096;
 /// Each round halves the ask, or lands exactly when the server quoted its own
 /// numbers, so two is enough for both. Past that the prompt is the problem.
 const MAX_BUDGET_RETRIES: u32 = 2;
+/// `AgentError::retry_message` falls back to the raw `API error (400): ...`
+/// body for an overflow, which is a paragraph of server arithmetic in a
+/// one-line status bar. The only part the user can act on is that the same
+/// turn is on its way back, asking for less.
+const BUDGET_RETRY_MESSAGE: &str = "output budget too large, retrying smaller";
 /// GPT models sometimes emit `functions.<name>`, a Codex training habit.
 /// Stripped here at the provider boundary so no raw name enters the agent;
 /// the batch plugin mirrors the rule in Lua.
@@ -107,10 +112,10 @@ impl From<StreamError> for AgentError {
 /// effort level the user picked arrives cut down unless twice its budget fits
 /// here. On a high level that is most of the model's output cap.
 ///
-/// The window clamp at the end is a backstop. Compaction reserves at least
-/// [`min_output`] ([`compaction::reserved`]), so a session that compacts on
-/// schedule only meets it when the thinking reservation is what crowds the
-/// window, and then the ceiling walks the thinking back down.
+/// The window clamp at the end is a backstop. Compaction reserves [`min_output`]
+/// where the window can spare it ([`compaction::reserved`]), so a session that
+/// compacts on schedule only meets it when the thinking reservation is what
+/// crowds the window, and then the ceiling walks the thinking back down.
 ///
 /// A model that declares no cap still gets a budget: "let the provider pick" is
 /// unbounded on the servers that most need bounding (llama.cpp hands over the
@@ -172,6 +177,7 @@ pub(crate) struct StreamRequest<'a> {
     /// than a coding turn, so the caller decides.
     pub output_budget: u32,
     pub session_id: Option<&'a SessionRef>,
+    pub retry: RetryPolicy,
 }
 
 /// `gauge` is `None` for a request whose messages are not the session's, as
@@ -192,6 +198,7 @@ pub(crate) async fn stream_with_retry(
         opts,
         output_budget,
         session_id,
+        retry,
     } = req;
     let opts = opts.clamped(model);
     // The session's own size wins where it is larger, being a count a provider
@@ -201,21 +208,21 @@ pub(crate) async fn stream_with_retry(
     let floor = min_output(model);
     let mut budget = planned_output(model, opts, output_budget, prompt);
     let mut budget_retries = 0;
+    // Counted here rather than off `retry`, which neither a budget retry nor a
+    // rotation spends, so the number otel and the status bar show never repeats
+    // or walks backwards.
+    let mut attempt = 0;
     // Rebuilding images a provider would refuse can take real time on the
     // first request of a session full of screenshots, and it all happens
     // before anything below can observe a cancel.
-    let adapted = futures_lite::future::race(
-        async { Ok(maki_providers::adapt_images_for_model(model, messages).await) },
-        async {
-            cancel.cancelled().await;
-            Err(StreamError::Cancelled {
-                streamed: String::new(),
-            })
-        },
-    )
-    .await?;
+    let adapted = cancel
+        .race(maki_providers::adapt_images_for_model(model, messages))
+        .await
+        .map_err(|_| StreamError::Cancelled {
+            streamed: String::new(),
+        })?;
     let messages = &*adapted;
-    let mut retry = RetryState::new();
+    let mut retry = RetryState::new(retry, provider.keys().map_or(1, |keys| keys.key_count()));
     loop {
         // The turn budget is all that moves. What the model declares stays put:
         // the thinking a request may spend is read off the `max_tokens` this
@@ -229,14 +236,13 @@ pub(crate) async fn stream_with_retry(
             let event_tx = event_tx.clone();
             async move { forward_provider_events(prx, &event_tx).await }
         });
-        let result = futures_lite::future::race(
-            provider.stream_message(model, messages, system, tools, &ptx, opts, session_id),
-            async {
-                cancel.cancelled().await;
-                Err(AgentError::Cancelled)
-            },
-        )
-        .await;
+        // `race` checks the token before it polls, so a run cancelled while a
+        // retry slept on a server `Retry-After` never pays for the attempt it
+        // woke up to make.
+        let result = cancel
+            .race(provider.stream_message(model, messages, system, tools, &ptx, opts, session_id))
+            .await
+            .unwrap_or(Err(AgentError::Cancelled));
         drop(ptx);
         let streamed = forwarder.await;
         match result {
@@ -249,71 +255,77 @@ pub(crate) async fn stream_with_retry(
                 return Ok(r);
             }
             Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
-            Err(e) if e.is_retryable() => {
-                emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
-                if e.should_rotate_key()
-                    && let Ok(true) = provider.rotate_key().await
-                {
-                    warn!("rotated API key after error: {e}");
-                }
-                let (attempt, delay) = retry.next_delay();
-                if matches!(e, AgentError::Timeout { .. }) && attempt > MAX_TIMEOUT_RETRIES {
-                    return Err(e.into());
-                }
-                let delay_ms = delay.as_millis() as u64;
-                warn!(attempt, delay_ms, error = %e, "retryable, will retry");
-                event_tx.send(AgentEvent::Retry {
-                    attempt,
-                    message: e.retry_message(),
-                    delay_ms,
-                })?;
-                futures_lite::future::race(
-                    async {
-                        smol::Timer::after(delay).await;
-                    },
-                    cancel.cancelled(),
-                )
-                .await;
-                if cancel.is_cancelled() {
-                    return Err(StreamError::Cancelled {
-                        streamed: String::new(),
-                    });
-                }
-            }
             Err(e) => {
-                emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
-                // A budget overflow is the one rejection maki caused itself, by
-                // asking for more output than the prompt left room for. Asking
-                // for less costs nothing, so it happens here instead of falling
-                // through to the caller, whose only remedy is to summarize the
-                // session away.
-                if let Some(
-                    overflow @ Overflow::Budget {
-                        prompt: measured, ..
-                    },
-                ) = e.overflow()
-                {
+                attempt += 1;
+                emit_api_error(model, &e, attempt, started.elapsed());
+                // Rotation is decided above anything `retry_kind()` says: a
+                // fresh key and a delay cure different problems. A 401 or a 403
+                // is dead for the key that produced it, fine for the next one,
+                // and carries no retry kind at all, while waiting is the only
+                // answer for a throttled account. So the pool gets walked
+                // first, on nobody's budget.
+                let rotated = e.should_rotate_key()
+                    && retry.book_rotation()
+                    && provider.keys().is_some_and(|keys| keys.rotate());
+                // Every arm below only decides what the next attempt costs, so
+                // the one tail after them is the only way round the loop.
+                let (message, delay) = if rotated {
+                    (e.retry_message(), Duration::ZERO)
+                } else if let Some(kind) = e.retry_kind() {
+                    let Some(delay) = retry.next_delay(kind, e.retry_after()) else {
+                        return Err(e.into());
+                    };
+                    (e.retry_message(), delay)
+                } else {
+                    // A budget overflow is the one rejection maki caused itself,
+                    // by asking for more output than the prompt left room for.
+                    // Asking for less costs nothing, so it happens here instead
+                    // of falling through to the caller, whose only remedy is to
+                    // summarize the session away.
+                    let Some(
+                        overflow @ Overflow::Budget {
+                            prompt: measured, ..
+                        },
+                    ) = e.overflow()
+                    else {
+                        return Err(e.into());
+                    };
                     // The server counted the prompt maki could only estimate.
                     if let Some(gauge) = gauge.as_deref_mut() {
                         gauge.record(measured.unwrap_or(0));
                     }
-                    if budget_retries < MAX_BUDGET_RETRIES
-                        && let Some(next) =
-                            shrunk_budget(budget, overflow, model.context_window, floor)
-                    {
-                        budget_retries += 1;
-                        warn!(
-                            model = %model.id,
-                            from = budget,
-                            to = next,
-                            measured_prompt = measured,
-                            "output budget did not fit the window, retrying smaller"
-                        );
-                        budget = next;
-                        continue;
-                    }
+                    let Some(next) = (budget_retries < MAX_BUDGET_RETRIES)
+                        .then(|| shrunk_budget(budget, overflow, model.context_window, floor))
+                        .flatten()
+                    else {
+                        return Err(e.into());
+                    };
+                    budget_retries += 1;
+                    warn!(
+                        model = %model.id,
+                        from = budget,
+                        to = next,
+                        measured_prompt = measured,
+                        "output budget did not fit the window, retrying smaller"
+                    );
+                    budget = next;
+                    (BUDGET_RETRY_MESSAGE.to_owned(), Duration::ZERO)
+                };
+                // Every way back around the loop passes here, and it has to:
+                // `AgentEvent::Retry` is the view's only cue to drop what the
+                // failed attempt streamed (`stream_reset`). A path that looped
+                // in silence would leave that text for the next attempt to be
+                // appended to.
+                let delay_ms = delay.as_millis() as u64;
+                warn!(attempt, delay_ms, rotated, error = %e, "retryable, will retry");
+                event_tx.send(AgentEvent::Retry {
+                    attempt,
+                    message,
+                    delay_ms,
+                })?;
+                if !delay.is_zero() {
+                    let _ = cancel.race(smol::Timer::after(delay)).await;
                 }
-                return Err(e.into());
             }
         }
     }
@@ -368,7 +380,9 @@ fn error_description(error: &AgentError) -> String {
 mod tests {
     use std::sync::Mutex;
 
-    use maki_providers::{Effort, Role, ThinkingConfig, TokenUsage};
+    use maki_providers::{
+        Effort, KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Role, ThinkingConfig, TokenUsage,
+    };
     use serde_json::json;
     use test_case::test_case;
 
@@ -556,10 +570,7 @@ mod tests {
 
     #[test]
     fn a_reported_api_error_leaves_the_provider_body_behind() {
-        let error = AgentError::Api {
-            status: 400,
-            message: SECRET_BODY.into(),
-        };
+        let error = AgentError::api(400, SECRET_BODY);
         let reported = error_description(&error);
         assert!(!reported.contains("private"));
         assert_eq!(reported, "API error (400)");
@@ -591,14 +602,14 @@ mod tests {
                 let asked = model.output_tokens().unwrap_or(0);
                 self.requests.lock().unwrap().push(asked);
                 if prompt + asked > self.window {
-                    return Err(AgentError::Api {
-                        status: 400,
-                        message: format!(
+                    return Err(AgentError::api(
+                        400,
+                        format!(
                             "This model's maximum context length is {} tokens. However, you requested {} tokens ({prompt} in the messages, {asked} in the completion).",
                             self.window,
                             prompt + asked
                         ),
-                    });
+                    ));
                 }
                 Ok(StreamResponse {
                     message: Message::user("ok".into()),
@@ -639,14 +650,15 @@ mod tests {
     }
 
     async fn send(
-        server: &StrictServer,
+        provider: &dyn Provider,
         model: &Model,
-        gauge: &mut ContextGauge,
-    ) -> Result<StreamResponse, StreamError> {
-        let (tx, _rx) = flume::unbounded();
-        stream_with_retry(
+        gauge: Option<&mut ContextGauge>,
+        retry: RetryPolicy,
+    ) -> (Result<StreamResponse, StreamError>, Vec<AgentEvent>) {
+        let (tx, rx) = flume::unbounded();
+        let result = stream_with_retry(
             StreamRequest {
-                provider: server,
+                provider,
                 model,
                 messages: &transcript(),
                 system: "",
@@ -654,12 +666,104 @@ mod tests {
                 opts: RequestOptions::default(),
                 output_budget: TURN_BUDGET,
                 session_id: None,
+                retry,
             },
-            Some(gauge),
+            gauge,
             &EventSender::new(tx, 0),
             &CancelToken::none(),
         )
-        .await
+        .await;
+        (
+            result,
+            rx.try_iter().map(|envelope| envelope.event).collect(),
+        )
+    }
+
+    fn retries_of(events: &[AgentEvent]) -> Vec<(u32, &str, u64)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Retry {
+                    attempt,
+                    message,
+                    delay_ms,
+                } => Some((*attempt, message.as_str(), *delay_ms)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const FIRST_ATTEMPT: u32 = 1;
+    const NO_WAIT: u64 = 0;
+
+    /// A race wakes from whichever side gets there first, so racing the token
+    /// against the request still sent it about half the time. `race` checks the
+    /// token before it polls at all.
+    #[test]
+    fn a_cancelled_run_is_never_billed_for_a_request() {
+        smol::block_on(async {
+            let server = StrictServer {
+                window: STRICT_WINDOW,
+                requests: Mutex::default(),
+            };
+            let (trigger, cancel) = CancelToken::new();
+            trigger.cancel();
+            let (tx, _rx) = flume::unbounded();
+
+            let result = stream_with_retry(
+                StreamRequest {
+                    provider: &server,
+                    model: &strict_model(STRICT_WINDOW),
+                    messages: &transcript(),
+                    system: "",
+                    tools: &json!([]),
+                    opts: RequestOptions::default(),
+                    output_budget: TURN_BUDGET,
+                    session_id: None,
+                    retry: RetryPolicy::default(),
+                },
+                None,
+                &EventSender::new(tx, 0),
+                &cancel,
+            )
+            .await;
+
+            assert!(matches!(result, Err(StreamError::Cancelled { .. })));
+            assert!(
+                server.requests.lock().unwrap().is_empty(),
+                "a cancelled run reached the provider"
+            );
+        });
+    }
+
+    /// `AgentEvent::Retry` is the only thing that makes the view drop what the
+    /// refused attempt already streamed, so a budget retry that shrinks the ask
+    /// silently leaves the dead attempt's text on screen for the answer that
+    /// replaces it to be appended to.
+    #[test_case(STRICT_WINDOW, &[] ; "a_request_that_fits_reports_nothing")]
+    #[test_case(CROWDED_WINDOW, &[(FIRST_ATTEMPT, BUDGET_RETRY_MESSAGE, NO_WAIT)] ; "a_shrunk_budget_is_reported_like_any_other_retry")]
+    fn every_way_round_the_loop_tells_the_view_to_start_over(
+        window: u32,
+        expected: &[(u32, &str, u64)],
+    ) {
+        smol::block_on(async {
+            let server = StrictServer {
+                window,
+                requests: Mutex::default(),
+            };
+            let mut gauge = ContextGauge::default();
+
+            let (result, events) = send(
+                &server,
+                &strict_model(window),
+                Some(&mut gauge),
+                RetryPolicy::default(),
+            )
+            .await;
+
+            result.expect("a shrunk budget is answered");
+            assert_eq!(retries_of(&events), expected);
+        });
     }
 
     #[test_case(STRICT_WINDOW, 1 ; "a_window_sized_cap_still_leaves_room_for_the_prompt")]
@@ -674,9 +778,15 @@ mod tests {
             };
             let mut gauge = ContextGauge::default();
 
-            let response = send(&server, &strict_model(window), &mut gauge)
-                .await
-                .expect("a flat budget leaves the window room for the prompt");
+            let response = send(
+                &server,
+                &strict_model(window),
+                Some(&mut gauge),
+                RetryPolicy::default(),
+            )
+            .await
+            .0
+            .expect("a flat budget leaves the window room for the prompt");
 
             let asks = server.requests.lock().unwrap().clone();
             assert_eq!(asks.len(), attempts, "asked for {asks:?}");
@@ -693,6 +803,155 @@ mod tests {
                 response.usage.input,
                 "the session keeps the server's count, not the estimate under it"
             );
+        });
+    }
+
+    const POOL_KEYS: [&str; 3] = ["sk-first", "sk-second", "sk-third"];
+    const FULL_POOL: usize = POOL_KEYS.len();
+    const SINGLE_KEY: usize = 1;
+    const RATE_LIMITED: u16 = 429;
+    const UNAUTHORIZED: u16 = 401;
+    const FORBIDDEN: u16 = 403;
+    const REJECTED_BODY: &str = "this key is done";
+    const POOLED_SLUG: &str = "pooled-test-server";
+
+    /// Every rotation case runs with nothing to spend, so any path that reaches
+    /// a budget fails on the spot: that the walk happens anyway is the proof
+    /// that a fresh key costs neither a retry nor a delay, and that no case
+    /// sleeps.
+    fn no_budget() -> RetryPolicy {
+        RetryPolicy {
+            max_retries: 0,
+            max_timeout_retries: 0,
+            ..RetryPolicy::default()
+        }
+    }
+
+    /// A server behind a key pool: it rejects with `status` until the key in
+    /// `relents_for` is the current one, and records the key every request was
+    /// made with, so a walk shows up as distinct keys rather than as a count.
+    struct PooledServer {
+        pool: KeyPool,
+        auth: Mutex<ResolvedAuth>,
+        status: u16,
+        relents_for: Option<&'static str>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl PooledServer {
+        fn new(keys: usize, status: u16, relents_for: Option<&'static str>) -> Self {
+            let pool = KeyPool::from_keys(POOL_KEYS[..keys].iter().map(|k| (*k).into()).collect());
+            let auth = ResolvedAuth::bearer(POOLED_SLUG, pool.current()).unwrap();
+            Self {
+                pool,
+                auth: Mutex::new(auth),
+                status,
+                relents_for,
+                seen: Mutex::default(),
+            }
+        }
+
+        fn keys_seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Provider for PooledServer {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let key = self.pool.current().to_owned();
+                let relents = self.relents_for == Some(key.as_str());
+                self.seen.lock().unwrap().push(key);
+                if !relents {
+                    return Err(AgentError::api(self.status, REJECTED_BODY));
+                }
+                Ok(StreamResponse {
+                    message: Message::user("ok".into()),
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            Box::pin(async { unimplemented!() })
+        }
+
+        fn keys(&self) -> Option<KeyRotation<'_>> {
+            Some(KeyRotation::new(&self.pool, &self.auth, KeyHeader::Bearer))
+        }
+    }
+
+    /// Sends one turn through the pool and checks what the loop's tail owes the
+    /// view for every rotation it took: a `Retry` event at all, so the failed
+    /// attempt's half printed text is dropped instead of appended to, and a
+    /// zero delay, because a fresh key waits for nothing.
+    async fn send_pooled(server: &PooledServer) -> Result<StreamResponse, StreamError> {
+        let (result, events) = send(server, &strict_model(STRICT_WINDOW), None, no_budget()).await;
+
+        let retries = retries_of(&events);
+        assert_eq!(
+            retries.len(),
+            server.keys_seen().len() - 1,
+            "every rotation announces itself: {events:?}"
+        );
+        for (nth, (attempt, _, delay_ms)) in retries.iter().enumerate() {
+            assert_eq!(*attempt as usize, nth + 1, "attempts count up from one");
+            assert_eq!(*delay_ms, NO_WAIT, "a rotation waits for nothing");
+        }
+        result
+    }
+
+    /// The reported regression: a 429 on the first key used to spend the rate
+    /// limit budget before anything rotated, so a pool whose budget was zero
+    /// never reached its other keys at all.
+    #[test]
+    fn a_fresh_key_is_tried_without_spending_the_retry_budget() {
+        smol::block_on(async {
+            let server = PooledServer::new(FULL_POOL, RATE_LIMITED, Some(POOL_KEYS[FULL_POOL - 1]));
+
+            send_pooled(&server)
+                .await
+                .expect("the last key in the pool answers");
+
+            assert_eq!(
+                server.keys_seen(),
+                POOL_KEYS,
+                "the walk tries each key once, in the pool's order"
+            );
+        });
+    }
+
+    /// A 401 and a 403 carry no retry kind at all, which is why rotation is
+    /// decided above `retry_kind()`: the key that produced one is dead and the
+    /// next one may be fine. Whatever the status, the walk ends when the pool
+    /// does.
+    #[test_case(RATE_LIMITED, FULL_POOL  ; "a_rate_limit_walks_the_whole_pool")]
+    #[test_case(UNAUTHORIZED, FULL_POOL  ; "unauthorized_walks_the_whole_pool")]
+    #[test_case(FORBIDDEN, FULL_POOL     ; "forbidden_walks_the_whole_pool")]
+    #[test_case(UNAUTHORIZED, SINGLE_KEY ; "a_lone_key_is_tried_once")]
+    fn a_spent_pool_is_walked_once_and_then_gives_up(status: u16, keys: usize) {
+        smol::block_on(async {
+            let server = PooledServer::new(keys, status, None);
+
+            let result = send_pooled(&server).await;
+
+            assert!(result.is_err(), "no key in the pool is accepted");
+            assert_eq!(server.keys_seen().len(), keys, "and no key is tried twice");
         });
     }
 }

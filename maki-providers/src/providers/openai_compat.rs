@@ -1,9 +1,11 @@
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
+use maki_storage::id::MakiId;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -18,10 +20,21 @@ const STREAM_DONE: &str = "[DONE]";
 /// not size the accumulator vec.
 const MAX_TOOL_CALLS_PER_MESSAGE: usize = 512;
 const UNNAMED_TOOL_ID_PREFIX: &str = "maki_unnamed_";
+/// How much of the `MakiId` ends up in every minted tool id. Taken off the
+/// tail, where the UUIDv7 keeps its random bytes (the head is the timestamp),
+/// and kept short so ids stay readable in logs.
+const PROCESS_TAG_LEN: usize = 8;
 /// The listing every OpenAI compatible API serves, relative to the base URL.
 /// Providers with a second catalog pass their own path instead.
 pub(crate) const MODELS_PATH: &str = "/models";
 static NEXT_UNNAMED_TOOL_ID: AtomicU64 = AtomicU64::new(0);
+/// Minted once per process: the counter alone restarts at 0 on every run, so a
+/// session resumed with `--continue` would mint ids that already exist in its
+/// own transcript.
+static PROCESS_TAG: LazyLock<String> = LazyLock::new(|| {
+    let id = MakiId::generate().to_string();
+    id[id.len() - PROCESS_TAG_LEN..].to_owned()
+});
 
 pub(crate) struct OpenAiCompatConfig {
     pub slug: &'static str,
@@ -525,11 +538,14 @@ impl ToolAccumulator {
     /// what lets `ToolUseStart` carry an id the agent can match against the
     /// finished call. The counter is process wide because a parent turn and a
     /// subagent turn stream side by side, and numbering per response had both of
-    /// them mint `maki_unnamed_0`.
+    /// them mint `maki_unnamed_0`. The per-process tag extends that uniqueness
+    /// across runs, so resuming a session cannot re-mint an id its transcript
+    /// already carries.
     fn new() -> Self {
         Self {
             id: format!(
-                "{UNNAMED_TOOL_ID_PREFIX}{}",
+                "{UNNAMED_TOOL_ID_PREFIX}{}_{}",
+                *PROCESS_TAG,
                 NEXT_UNNAMED_TOOL_ID.fetch_add(1, Ordering::Relaxed)
             ),
             name: String::new(),
@@ -780,6 +796,9 @@ data: [DONE]\n";
         "two turns streaming at once must not land on the same synthetic id";
     const PENDING_ID_MUST_MATCH: &str =
         "the id streamed as the call starts must match the finished tool call";
+    const PREFIX_MUST_SURVIVE: &str = "everything that recognises a minted id keys off the prefix";
+    const TAG_MUST_BE_PER_PROCESS: &str =
+        "the tag separates runs of the same session, so it is stable within a process";
 
     #[test_case(json!({"name": TOOL_NAME, "description": TOOL_DESCRIPTION}) ; "missing_schema")]
     #[test_case(json!({"name": TOOL_NAME, "description": TOOL_DESCRIPTION, "input_schema": null}) ; "null_schema")]
@@ -1096,7 +1115,9 @@ data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\
                 .unwrap_err();
 
             match err {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 529);
                     assert_eq!(message, "Server overloaded");
                 }
@@ -1163,6 +1184,23 @@ data: [DONE]\n";
             minted.dedup();
             assert_eq!(minted.len(), total, "{IDS_MUST_DIFFER}");
         })
+    }
+
+    #[test]
+    fn minted_tool_ids_differ_and_carry_the_process_tag() {
+        let first = ToolAccumulator::new().id;
+        let second = ToolAccumulator::new().id;
+
+        assert_ne!(first, second, "{IDS_MUST_DIFFER}");
+        for id in [&first, &second] {
+            let tail = id
+                .strip_prefix(UNNAMED_TOOL_ID_PREFIX)
+                .unwrap_or_else(|| panic!("{PREFIX_MUST_SURVIVE}: {id}"));
+            let (tag, counter) = tail.split_once('_').expect("minted ids carry a counter");
+            assert_eq!(tag, *PROCESS_TAG, "{TAG_MUST_BE_PER_PROCESS}");
+            assert_eq!(tag.len(), PROCESS_TAG_LEN, "{TAG_MUST_BE_PER_PROCESS}");
+            assert!(counter.parse::<u64>().is_ok(), "{IDS_MUST_DIFFER}");
+        }
     }
 
     #[test]

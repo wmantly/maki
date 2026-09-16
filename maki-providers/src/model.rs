@@ -4,6 +4,7 @@
 //! + cache reads/writes because the context window limit applies to all of them combined.
 
 use std::any::Any;
+use std::cmp::Ordering;
 use std::fmt;
 use std::ops::AddAssign;
 use std::str::FromStr;
@@ -134,13 +135,56 @@ pub enum ModelFamily {
     Synthetic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+/// Ordering is a cost guarantee (a subagent may never run on a pricier tier
+/// than its parent), so the strength is written down in [`ModelTier::strength`]
+/// instead of being inherited from declaration order, where inserting or moving
+/// a variant would silently redefine "stronger". `Ord` stays because the tier is
+/// also a `BTreeMap` key in `model_registry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelTier {
     Weak,
     Medium,
     Strong,
     Compaction,
+}
+
+impl ModelTier {
+    /// `Compaction` is not a capability tier: it is a user-assigned slot for the
+    /// cheap model that rewrites history. It therefore ranks below every agent
+    /// tier, which makes it the tightest ceiling a parent can impose - a session
+    /// on a compaction model hands its children that same model rather than
+    /// letting them escalate to a capability tier.
+    const fn strength(self) -> u8 {
+        match self {
+            Self::Compaction => 0,
+            Self::Weak => 1,
+            Self::Medium => 2,
+            Self::Strong => 3,
+        }
+    }
+
+    /// The single named way to cap a requested tier, so no call site re-derives
+    /// the cost rule with an ad-hoc comparison.
+    pub fn capped_at(self, ceiling: Self) -> Self {
+        if self.strength() <= ceiling.strength() {
+            self
+        } else {
+            ceiling
+        }
+    }
+}
+
+impl Ord for ModelTier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.strength().cmp(&other.strength())
+    }
+}
+
+impl PartialOrd for ModelTier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl fmt::Display for ModelTier {
@@ -880,6 +924,10 @@ mod tests {
 
     const EPSILON: f64 = 1e-10;
 
+    /// Declaration index of `Compaction`, which a derived `Ord` would read as
+    /// the strongest tier.
+    const COMPACTION_DECLARED_LAST: u8 = 3;
+
     /// The only builtin whose rates move with the wall clock.
     const SCHEDULED_PROVIDERS: [&str; 1] = ["deepseek"];
     const DEEPSEEK_SPEC: &str = "deepseek/deepseek-v4-pro";
@@ -1255,6 +1303,50 @@ mod tests {
                 assert!(model.context_window >= max_output);
             }
         }
+    }
+
+    #[test_case(ModelTier::Strong, ModelTier::Weak, ModelTier::Weak ; "strong_child_capped_to_weak_parent")]
+    #[test_case(ModelTier::Weak, ModelTier::Strong, ModelTier::Weak ; "weak_child_stays_weak_under_strong_parent")]
+    #[test_case(ModelTier::Medium, ModelTier::Medium, ModelTier::Medium ; "equal_tiers_pass_through")]
+    #[test_case(ModelTier::Strong, ModelTier::Compaction, ModelTier::Compaction ; "strong_child_capped_to_compaction_parent")]
+    #[test_case(ModelTier::Medium, ModelTier::Compaction, ModelTier::Compaction ; "medium_child_capped_to_compaction_parent")]
+    #[test_case(ModelTier::Compaction, ModelTier::Strong, ModelTier::Compaction ; "compaction_child_is_not_escalated")]
+    fn capped_at_never_exceeds_ceiling(
+        requested: ModelTier,
+        ceiling: ModelTier,
+        expected: ModelTier,
+    ) {
+        assert_eq!(requested.capped_at(ceiling), expected);
+        assert!(requested.capped_at(ceiling) <= ceiling);
+    }
+
+    #[test]
+    fn every_tier_under_a_compaction_ceiling_stays_at_compaction() {
+        for &tier in &TIERS {
+            assert_eq!(tier.capped_at(ModelTier::Compaction), ModelTier::Compaction);
+        }
+    }
+
+    /// Fails if the variants get reordered (the hand-written strength table
+    /// would no longer be the thing that disagrees with declaration order) or if
+    /// the explicit `Ord` is ever replaced by a derive, which would rank
+    /// `Compaction` above `Strong` and turn the subagent cap into a no-op.
+    #[test]
+    fn tier_order_is_explicit_not_declaration_order() {
+        assert_eq!(ModelTier::Compaction as u8, COMPACTION_DECLARED_LAST);
+        assert!(ModelTier::Compaction < ModelTier::Weak);
+
+        let mut tiers = TIERS;
+        tiers.sort();
+        assert_eq!(
+            tiers,
+            [
+                ModelTier::Compaction,
+                ModelTier::Weak,
+                ModelTier::Medium,
+                ModelTier::Strong
+            ]
+        );
     }
 
     #[test]

@@ -127,7 +127,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * Plan mode.
 * Run bash commands using `!`, or `!!` if you want maki to not know about it.
 * `/cd` to change dir.
-* Use `--print --output-format stream-json` to run UI-less. Output is compatible with Claude Code, so you can easily replace your existing solutions (although I wouldn't recommend that, maki is very new).
+* Use `--print --output-format stream-json` to run UI-less. Output is compatible with Claude Code, so you can easily replace your existing solutions.
 
 ## Supported providers
 

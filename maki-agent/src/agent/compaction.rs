@@ -1,11 +1,13 @@
 use std::env;
 
 use maki_config::AgentConfig;
+use maki_providers::retry::RetryPolicy;
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
     StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
+use serde_json::Value;
 use tracing::info;
 
 use super::history::{History, remove_orphaned_tool_results};
@@ -25,6 +27,19 @@ const RECENT_TOOL_RESULT_BUDGET: usize = 64 * 1024;
 /// budget would reserve tens of thousands it cannot use, on the one request
 /// already sent under the most context pressure a session ever sees.
 const SUMMARY_OUTPUT_BUDGET: u32 = 16_384;
+/// Ceiling on everything [`reserved`] holds back, as a share of the window.
+///
+/// The floor under a reservation is a fixed token count and the buffer can be
+/// written as one, so on a small window either can reach the whole context. A
+/// reservation that large leaves no usable window at all: every turn reads as
+/// an overflow, and compaction cannot get under a threshold of zero, so a
+/// llama.cpp server started with `n_ctx 4096` summarized itself before every
+/// single turn.
+const MAX_RESERVED_PERCENT: u32 = 50;
+
+fn percent_of(tokens: u32, percent: u32) -> u32 {
+    (u64::from(tokens) * u64::from(percent) / 100) as u32
+}
 
 fn normalize(text: Option<&str>) -> Option<&str> {
     text.map(str::trim).filter(|t| !t.is_empty())
@@ -72,6 +87,7 @@ pub(super) async fn compact_history(
     instructions: Option<&str>,
     carry_len: usize,
     session_id: Option<&SessionRef>,
+    retry: RetryPolicy,
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
     let summarized = history.len().saturating_sub(carry_len);
@@ -97,6 +113,7 @@ pub(super) async fn compact_history(
                 opts: RequestOptions::default(),
                 output_budget: SUMMARY_OUTPUT_BUDGET,
                 session_id,
+                retry,
             },
             // A stripped, collapsed rewrite of the transcript, far smaller than
             // it. Sizing this request as the session would trim the
@@ -176,35 +193,54 @@ fn finish_compact(
     Ok(response.usage)
 }
 
+/// `system` and `tools` are the ones the next request will carry: compaction
+/// replaces the transcript and leaves that baseline untouched, so the gauge
+/// cannot be resized without them.
+///
+/// A retry in here can honour a server `Retry-After` that parks the request for
+/// an hour, so esc has to reach it. The cancel comes back as
+/// `Ok(DoneReason::Cancelled)`, like [`Agent::run`](super::Agent::run) does, to
+/// leave the error path for real failures.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact(
     provider: &dyn maki_providers::provider::Provider,
     model: &Model,
     history: &mut History,
     gauge: &mut ContextGauge,
+    system: &str,
+    tools: &Value,
     event_tx: &EventSender,
+    cancel: &CancelToken,
     config: &AgentConfig,
     instructions: Option<&str>,
     session_id: Option<&SessionRef>,
-) -> Result<(), AgentError> {
-    let cancel = CancelToken::none();
+    retry: RetryPolicy,
+) -> Result<DoneReason, AgentError> {
     let size_before = gauge.size();
-    let usage = compact_history(
+    let usage = match compact_history(
         provider,
         model,
         history,
         event_tx,
-        &cancel,
+        cancel,
         config,
         instructions,
         0,
         session_id,
+        retry,
     )
-    .await?;
+    .await
+    {
+        Ok(usage) => usage,
+        // `finish_compact` is the only writer in here, so a cancel leaves the
+        // transcript and the gauge untouched and the session carries on.
+        Err(AgentError::Cancelled) => return Ok(DoneReason::Cancelled),
+        Err(e) => return Err(e),
+    };
     if let Some(post) = normalize(config.post_compaction_instructions.as_deref()) {
         history.push(Message::synthetic(post.to_string()));
     }
-    gauge.reset(history.as_slice());
+    gauge.reset(history.as_slice(), system, tools);
 
     // The summariser read a subset of the session's prompt, so its own count is
     // a floor on the size before, and the only number a gauge that has not seen
@@ -229,7 +265,7 @@ pub async fn compact(
         reason: DoneReason::Compact,
     })?;
 
-    Ok(())
+    Ok(DoneReason::Compact)
 }
 
 /// Context held back from the transcript.
@@ -243,15 +279,26 @@ pub async fn compact(
 /// Reserving a whole [`AgentConfig::max_turn_output`] would guarantee more and
 /// cost more: on a small window that is half the context, and compacting that
 /// early hurts worse than the odd turn whose output budget gets trimmed.
+///
+/// Whatever the floor and the buffer work out to, [`MAX_RESERVED_PERCENT`] has
+/// the last word, because a reservation that eats the window leaves compaction
+/// nothing to compact into.
 pub(super) fn reserved(model: &Model, config: &AgentConfig) -> u32 {
     config
         .compaction_buffer
         .resolve(model.context_window)
         .max(min_output(model))
+        .min(percent_of(model.context_window, MAX_RESERVED_PERCENT))
+}
+
+/// What [`reserved`] leaves the transcript. Always a real number of tokens, so
+/// `>=` against it is a threshold a session can sit below.
+pub(super) fn usable(model: &Model, config: &AgentConfig) -> u32 {
+    model.context_window - reserved(model, config)
 }
 
 pub(super) fn is_overflow(context_tokens: u32, model: &Model, config: &AgentConfig) -> bool {
-    context_tokens >= model.context_window.saturating_sub(reserved(model, config))
+    context_tokens >= usable(model, config)
 }
 
 fn strip_images(messages: &mut [Message]) {
@@ -359,6 +406,13 @@ mod tests {
     const OLD_RESULT: &str = "old";
     const NEW_RESULT: &str = "new result";
     const KEPT_TEXT: &str = "keep me";
+    /// These tests assert on the transcript and on gauge sizes relative to each
+    /// other, so the baseline would only add noise.
+    const NO_SYSTEM: &str = "";
+
+    fn no_tools() -> Value {
+        Value::Array(Vec::new())
+    }
 
     struct MockProvider {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
@@ -415,10 +469,7 @@ mod tests {
     }
 
     fn overflow_error() -> AgentError {
-        AgentError::Api {
-            status: OVERFLOW_STATUS,
-            message: OVERFLOW_MESSAGE.into(),
-        }
+        AgentError::api(OVERFLOW_STATUS, OVERFLOW_MESSAGE)
     }
 
     fn text_response(stop_reason: StopReason) -> StreamResponse {
@@ -441,17 +492,22 @@ mod tests {
         gauge: &mut ContextGauge,
         config: &AgentConfig,
         instructions: Option<&str>,
-    ) -> Result<(), AgentError> {
+        cancel: &CancelToken,
+    ) -> Result<DoneReason, AgentError> {
         let (raw_tx, _rx) = flume::unbounded();
         compact(
             provider,
             &default_model(),
             history,
             gauge,
+            NO_SYSTEM,
+            &no_tools(),
             &EventSender::new(raw_tx, 0),
+            cancel,
             config,
             instructions,
             None,
+            RetryPolicy::default(),
         )
         .await
     }
@@ -473,6 +529,7 @@ mod tests {
             None,
             carry_len,
             session_id,
+            RetryPolicy::default(),
         )
         .await
         .unwrap();
@@ -499,6 +556,7 @@ mod tests {
                 &mut ContextGauge::default(),
                 &AgentConfig::default(),
                 None,
+                &CancelToken::none(),
             )
             .await
             .unwrap();
@@ -534,6 +592,7 @@ mod tests {
                 &mut gauge,
                 &AgentConfig::default(),
                 None,
+                &CancelToken::none(),
             )
             .await
             .unwrap();
@@ -573,6 +632,7 @@ mod tests {
                 &mut gauge,
                 &AgentConfig::default(),
                 None,
+                &CancelToken::none(),
             )
             .await
             .expect_err("empty summary must fail");
@@ -607,6 +667,7 @@ mod tests {
                 &mut ContextGauge::default(),
                 &AgentConfig::default(),
                 None,
+                &CancelToken::none(),
             )
             .await
             .expect_err("empty summary must fail");
@@ -614,6 +675,38 @@ mod tests {
             assert!(matches!(err, AgentError::EmptySummary));
             assert_eq!(history.len(), 1);
             assert_eq!(history.as_slice()[0].user_text(), Some(KEPT));
+        });
+    }
+
+    #[test]
+    fn compact_reports_a_cancel_as_an_ending_not_a_failure() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+            let (trigger, cancel) = CancelToken::new();
+            trigger.cancel();
+
+            let reason = summarize(
+                &provider,
+                &mut history,
+                &mut ContextGauge::default(),
+                &AgentConfig::default(),
+                None,
+                &cancel,
+            )
+            .await
+            .expect("a cancel is an ending, not a failure");
+
+            assert_eq!(reason, DoneReason::Cancelled);
+            assert!(
+                provider.requests.lock().unwrap().is_empty(),
+                "the cancel should have landed before the request went out"
+            );
+            assert_eq!(
+                history.as_slice()[0].user_text(),
+                Some(KEPT_TEXT),
+                "a cancelled compaction must leave the transcript alone"
+            );
         });
     }
 
@@ -636,6 +729,7 @@ mod tests {
                 &mut ContextGauge::default(),
                 &config,
                 Some(REQUEST_EXTRA),
+                &CancelToken::none(),
             )
             .await
             .unwrap();
@@ -737,6 +831,11 @@ mod tests {
     #[test_case(262_144, 0,       0,       0,      262_144, true  ; "equal_context_and_max_output")]
     #[test_case(51_199,  0,       0,       0,      64_000,  false ; "small_window_below_scaled_threshold")]
     #[test_case(51_200,  0,       0,       0,      64_000,  true  ; "small_window_at_scaled_threshold")]
+    // The output floor alone is the whole window here, so without a ceiling on
+    // the reservation every one of these would overflow on an empty transcript.
+    #[test_case(2_047,   0,       0,       0,      4_096,   false ; "llama_cpp_default_window_is_usable")]
+    #[test_case(2_048,   0,       0,       0,      4_096,   true  ; "llama_cpp_default_window_still_compacts")]
+    #[test_case(0,       0,       0,       0,      1_024,   false ; "an_empty_transcript_never_overflows")]
     fn overflow_detection(
         input: u32,
         cache_read: u32,

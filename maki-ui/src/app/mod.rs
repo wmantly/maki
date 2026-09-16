@@ -59,7 +59,7 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
-use maki_agent::permissions::{PermissionAnswer, PermissionManager};
+use maki_agent::permissions::{PermissionAnswer, PermissionManager, TaggedAnswer};
 use maki_agent::{
     AgentEvent, Envelope, ImageMediaType, ImageSource, McpConfigErrors, McpPromptInfo,
     McpSnapshotReader, SharedMessages, SubagentInfo, ToolOutput,
@@ -311,7 +311,6 @@ pub struct App {
     pub(crate) queue: MessageQueue,
     recoverable_queue: Vec<String>,
     pub answer_tx: Option<flume::Sender<String>>,
-    pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
     pub(super) pending_input: PendingInput,
     pub(crate) run_id: u64,
     pub(super) retry_info: Option<RetryInfo>,
@@ -420,7 +419,6 @@ impl App {
             queue: MessageQueue::default(),
             recoverable_queue: Vec::new(),
             answer_tx: None,
-            cmd_tx: None,
             pending_input: PendingInput::None,
             run_id: 0,
             retry_info: None,
@@ -1048,7 +1046,8 @@ impl App {
         if self.permission_prompt.is_open() {
             if let Some(answer) = self.permission_prompt.handle_key(key) {
                 let subagent_id = self.permission_prompt.subagent_id().map(str::to_owned);
-                let encoded = answer.encode();
+                let request_id = self.permission_prompt.request_id().unwrap_or_default();
+                let encoded = TaggedAnswer::new(request_id, answer).encode();
                 self.permission_prompt.close();
                 self.send_to_agent(subagent_id.as_deref(), encoded);
             }

@@ -7,7 +7,7 @@
 //! hyphenated-hex UUIDv7 shape that Claude Code SDK consumers expect, rather than maki's base58
 //! `MakiId` canonical form.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::mem;
 use std::path::Path;
@@ -19,7 +19,7 @@ use color_eyre::eyre::{Context, eyre};
 use flume::Sender;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
-use maki_agent::permissions::{PermissionAnswer, PluginRuleStore};
+use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
@@ -464,7 +464,10 @@ pub struct SdkParams {
 /// recorded while a source that could answer it exists.
 struct Permissions {
     answer_tx: Sender<String>,
-    outstanding: HashSet<String>,
+    /// Wire request id to the agent-side ask it stands for. The agent only
+    /// accepts an answer naming the ask it is parked on, so the id it asked
+    /// with has to survive the round trip through stdin.
+    outstanding: HashMap<String, String>,
     answerable: bool,
 }
 
@@ -472,34 +475,37 @@ impl Permissions {
     fn new(answer_tx: Sender<String>) -> Self {
         Self {
             answer_tx,
-            outstanding: HashSet::new(),
+            outstanding: HashMap::new(),
             answerable: true,
         }
     }
 
-    fn answer(&self, answer: PermissionAnswer) {
-        let _ = self.answer_tx.send(answer.encode());
+    fn answer(&self, ask_id: &str, answer: PermissionAnswer) {
+        let _ = self
+            .answer_tx
+            .send(TaggedAnswer::new(ask_id, answer).encode());
     }
 
-    fn deny_unanswerable(&self, request_id: &str) {
-        warn!(%request_id, "denying tool permission: stdin closed");
-        self.answer(PermissionAnswer::Deny);
+    fn deny_unanswerable(&self, request_id: &str, ask_id: &str) {
+        warn!(%request_id, %ask_id, "denying tool permission: stdin closed");
+        self.answer(ask_id, PermissionAnswer::Deny);
     }
 
-    /// Records an outstanding request. `false` means nobody is left to answer
-    /// it, so it was denied here and must not be put on the wire.
-    fn ask(&mut self, request_id: String) -> bool {
+    /// Records an outstanding request against the ask it answers. `false` means
+    /// nobody is left to answer it, so it was denied here and must not be put
+    /// on the wire.
+    fn ask(&mut self, request_id: String, ask_id: String) -> bool {
         if !self.answerable {
-            self.deny_unanswerable(&request_id);
+            self.deny_unanswerable(&request_id, &ask_id);
             return false;
         }
-        self.outstanding.insert(request_id);
+        self.outstanding.insert(request_id, ask_id);
         true
     }
 
     fn resolve(&mut self, request_id: &str, answer: PermissionAnswer) {
-        if self.outstanding.remove(request_id) {
-            self.answer(answer);
+        if let Some(ask_id) = self.outstanding.remove(request_id) {
+            self.answer(&ask_id, answer);
         }
     }
 
@@ -511,8 +517,8 @@ impl Permissions {
     /// No further answers can arrive. Idempotent.
     fn close(&mut self) {
         self.answerable = false;
-        for request_id in std::mem::take(&mut self.outstanding) {
-            self.deny_unanswerable(&request_id);
+        for (request_id, ask_id) in std::mem::take(&mut self.outstanding) {
+            self.deny_unanswerable(&request_id, &ask_id);
         }
     }
 }
@@ -1141,7 +1147,9 @@ impl EventPump {
                 {
                     let shared = self.shared.lock().unwrap();
                     if shared.permission_mode == PermissionMode::BypassPermissions {
-                        shared.permissions.answer(PermissionAnswer::AllowSession);
+                        shared
+                            .permissions
+                            .answer(id, PermissionAnswer::AllowSession);
                         return Ok(());
                     }
                 }
@@ -1154,7 +1162,13 @@ impl EventPump {
 
                 self.request_counter += 1;
                 let req_id = format!("req_{}", self.request_counter);
-                if !self.shared.lock().unwrap().permissions.ask(req_id.clone()) {
+                if !self
+                    .shared
+                    .lock()
+                    .unwrap()
+                    .permissions
+                    .ask(req_id.clone(), id.clone())
+                {
                     return Ok(());
                 }
 
@@ -1612,6 +1626,12 @@ mod tests {
     const OUTSTANDING_REQ: &str = "req_1";
     const LATE_REQ: &str = "req_2";
 
+    /// Every answer in these tests belongs to the one ask `permission_request`
+    /// makes, and the agent only takes an answer naming it.
+    fn tagged(answer: PermissionAnswer) -> String {
+        TaggedAnswer::new(TEST_TOOL_USE_ID, answer).encode()
+    }
+
     fn test_pump(
         permission_mode: PermissionMode,
         answer_tx: Sender<String>,
@@ -1684,14 +1704,14 @@ mod tests {
         let (answer_tx, answer_rx) = flume::unbounded();
         let mut permissions = Permissions::new(answer_tx);
 
-        assert!(permissions.ask(OUTSTANDING_REQ.to_owned()));
+        assert!(permissions.ask(OUTSTANDING_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
         assert!(answer_rx.is_empty());
 
         permissions.close();
-        assert_eq!(answer_rx.try_recv(), Ok(PermissionAnswer::Deny.encode()));
+        assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
 
-        assert!(!permissions.ask(LATE_REQ.to_owned()));
-        assert_eq!(answer_rx.try_recv(), Ok(PermissionAnswer::Deny.encode()));
+        assert!(!permissions.ask(LATE_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
+        assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
 
         permissions.close();
         assert!(answer_rx.is_empty());
@@ -1705,7 +1725,7 @@ mod tests {
     fn only_requests_the_agent_waits_on_get_answered() {
         let (answer_tx, answer_rx) = flume::unbounded();
         let mut permissions = Permissions::new(answer_tx);
-        assert!(permissions.ask(OUTSTANDING_REQ.to_owned()));
+        assert!(permissions.ask(OUTSTANDING_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
 
         permissions.resolve(LATE_REQ, PermissionAnswer::AllowOnce);
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
@@ -1713,18 +1733,21 @@ mod tests {
         permissions.resolve(OUTSTANDING_REQ, PermissionAnswer::AllowOnce);
         assert_eq!(
             answer_rx.try_recv(),
-            Ok(PermissionAnswer::AllowOnce.encode())
+            Ok(tagged(PermissionAnswer::AllowOnce))
         );
 
         permissions.resolve(OUTSTANDING_REQ, PermissionAnswer::AllowOnce);
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
 
-        assert!(permissions.ask(LATE_REQ.to_owned()));
+        assert!(permissions.ask(LATE_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()));
         permissions.forget_outstanding();
         permissions.resolve(LATE_REQ, PermissionAnswer::AllowOnce);
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
 
-        assert!(permissions.ask(OUTSTANDING_REQ.to_owned()), "{SOURCE_OPEN}");
+        assert!(
+            permissions.ask(OUTSTANDING_REQ.to_owned(), TEST_TOOL_USE_ID.to_owned()),
+            "{SOURCE_OPEN}"
+        );
         permissions.forget_outstanding();
         permissions.close();
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
@@ -1742,7 +1765,7 @@ mod tests {
 
         assert_eq!(
             answer_rx.try_recv(),
-            Ok(PermissionAnswer::AllowSession.encode())
+            Ok(tagged(PermissionAnswer::AllowSession))
         );
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
         assert!(out_rx.is_empty(), "{NO_CONTROL_REQUEST}");
@@ -1780,13 +1803,13 @@ mod tests {
             .resolve(&request_id, PermissionAnswer::AllowOnce);
         assert_eq!(
             answer_rx.try_recv(),
-            Ok(PermissionAnswer::AllowOnce.encode())
+            Ok(tagged(PermissionAnswer::AllowOnce))
         );
 
         pump.shared.lock().unwrap().permissions.close();
         pump.handle(permission_request()).unwrap();
 
-        assert_eq!(answer_rx.try_recv(), Ok(PermissionAnswer::Deny.encode()));
+        assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
         assert!(out_rx.is_empty(), "{NO_CONTROL_REQUEST}");
     }
 }

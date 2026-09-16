@@ -120,9 +120,17 @@ impl ContextGauge {
 
     /// Starts over from a transcript nobody has sent yet, as compaction leaves
     /// behind. Whatever was measured describes messages that no longer exist.
-    pub fn reset(&mut self, messages: &[Message]) {
-        *self = Self::default();
-        self.append(messages);
+    ///
+    /// Takes the whole prompt and not just the transcript, because the system
+    /// prompt and the tool schemas stay in every request compaction did not
+    /// touch. Sized from the messages alone, a freshly compacted session reads
+    /// as having a five figure baseline of room it does not have, and spends it
+    /// on a provider overflow instead of the next scheduled compaction.
+    pub fn reset(&mut self, messages: &[Message], system: &str, tools: &Value) {
+        *self = Self {
+            measured: 0,
+            appended: estimate_prompt_tokens(messages, system, tools),
+        };
     }
 
     /// A resumed session can already fill the window, and the gauge only learns
@@ -130,7 +138,7 @@ impl ContextGauge {
     /// out unguarded.
     pub fn seed_if_empty(&mut self, messages: &[Message], system: &str, tools: &Value) {
         if self.size() == 0 {
-            self.appended = estimate_prompt_tokens(messages, system, tools);
+            self.reset(messages, system, tools);
         }
     }
 }
@@ -185,8 +193,49 @@ mod tests {
     #[test]
     fn a_reset_drops_the_measurement_with_the_transcript() {
         let mut gauge = ContextGauge::restored(MEASURED);
-        gauge.reset(&[text_message(TEXT_BYTES)]);
+        gauge.reset(&[text_message(TEXT_BYTES)], "", &json!([]));
         assert_eq!(gauge.size(), TEXT_TOKENS);
+    }
+
+    /// Compaction shrinks the transcript and nothing else, so a gauge that
+    /// forgets the baseline here under-reports by the whole tool catalog and
+    /// lets the session sail past the threshold that would have compacted it.
+    #[test]
+    fn a_reset_keeps_the_system_prompt_and_tool_schemas_in_the_size() {
+        let messages = [text_message(TEXT_BYTES)];
+        let tools = json!([{"name": "read", "input_schema": {"path": "string"}}]);
+
+        let mut bare = ContextGauge::default();
+        bare.reset(&messages, "", &json!([]));
+
+        let mut with_baseline = ContextGauge::default();
+        with_baseline.reset(&messages, &"s".repeat(TEXT_BYTES), &tools);
+
+        assert_eq!(bare.size(), TEXT_TOKENS);
+        assert_eq!(
+            with_baseline.size(),
+            estimate_prompt_tokens(&messages, &"s".repeat(TEXT_BYTES), &tools)
+        );
+        assert!(
+            with_baseline.size() > bare.size() + TEXT_TOKENS,
+            "the reset size is blind to the system prompt and the tool schemas"
+        );
+    }
+
+    /// Two entry points onto one size: if they ever disagree, whichever one a
+    /// call site happens to use decides when the session overflows.
+    #[test]
+    fn reset_and_seeding_size_the_same_prompt_alike() {
+        let messages = [text_message(TEXT_BYTES)];
+        let system = "s".repeat(TEXT_BYTES);
+        let tools = json!([{"name": "read"}]);
+
+        let mut reset = ContextGauge::restored(MEASURED);
+        reset.reset(&messages, &system, &tools);
+        let mut seeded = ContextGauge::default();
+        seeded.seed_if_empty(&messages, &system, &tools);
+
+        assert_eq!(reset.size(), seeded.size());
     }
 
     #[test]

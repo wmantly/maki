@@ -202,9 +202,34 @@ pub async fn adapt_images_for_model<'a>(
     if edits.is_empty() {
         return Cow::Borrowed(messages);
     }
-    let mut adapted = messages.to_vec();
-    for (m, b, block) in edits {
-        adapted[m].content[b] = block;
+    // A settled image hands its cached verdict back, so once anything here
+    // needed repairing `edits` is non-empty on every later turn too. The owned
+    // slice a provider takes has to carry every message, so the untouched ones
+    // are still cloned, but only a message an edit lands on is rebuilt, and it
+    // is rebuilt out of the blocks it keeps rather than cloned whole and then
+    // written over. History keeps the originals on purpose: see above.
+    // The walk above ran newest-first, so reversing the edits lines them up
+    // with a single forward pass.
+    let mut edits = edits.into_iter().rev().peekable();
+    let mut adapted = Vec::with_capacity(messages.len());
+    for (m, message) in messages.iter().enumerate() {
+        if edits.peek().is_none_or(|&(edited, ..)| edited != m) {
+            adapted.push(message.clone());
+            continue;
+        }
+        let mut content = Vec::with_capacity(message.content.len());
+        for (b, block) in message.content.iter().enumerate() {
+            match edits.next_if(|&(edited, at, _)| (edited, at) == (m, b)) {
+                Some((.., replacement)) => content.push(replacement),
+                None => content.push(block.clone()),
+            }
+        }
+        adapted.push(Message {
+            role: message.role.clone(),
+            content,
+            display_text: message.display_text.clone(),
+            kind: message.kind,
+        });
     }
     Cow::Owned(adapted)
 }
@@ -858,14 +883,18 @@ impl ThinkingConfig {
 
     /// Caps this config at `parent`. A subagent's thinking request is written
     /// by the model, not the user, so it may go down but never above what the
-    /// parent session runs with. `Adaptive` on either side means "let the model
-    /// decide" rather than a ceiling, so it never caps. Both sides compare as
-    /// token budgets, which is the only unit an effort level and an explicit
-    /// count share; the winner keeps its original form either way.
+    /// parent session runs with. A parent of `Adaptive` set no ceiling at all,
+    /// so the child gets whatever it asked for; but against a parent that did
+    /// name a level or a count, a child's `Adaptive` is "let the model decide"
+    /// with no upper bound, which sits above any concrete ceiling, so the
+    /// parent's config wins. Concrete sides compare as token budgets, the only
+    /// unit an effort level and an explicit count share; the winner keeps its
+    /// original form either way.
     pub fn clamp_to(self, parent: Self) -> Self {
         match (parent.budget(None), self.budget(None)) {
             (Budgeted::Off, _) | (_, Budgeted::Off) => Self::Off,
-            (Budgeted::Adaptive, _) | (_, Budgeted::Adaptive) => self,
+            (Budgeted::Adaptive, _) => self,
+            (_, Budgeted::Adaptive) => parent,
             (Budgeted::Tokens(ceiling), Budgeted::Tokens(asked)) => {
                 if asked <= ceiling {
                     self
@@ -1154,6 +1183,65 @@ mod tests {
         ));
     }
 
+    /// A repaired image is repaired for the rest of the session, so this path
+    /// is walked on every later turn: the messages the repair does not reach
+    /// must come out of it untouched, and history must keep its own pixels.
+    #[test]
+    fn adapt_images_rebuilds_only_the_messages_that_change() {
+        const CAPTION: &str = "look";
+        const OVERSIZED: u32 = 2600;
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let fine = ImageSource::new(
+            ImageMediaType::Png,
+            Arc::from(crate::image::png_base64(32, 32)),
+        );
+        let carries = |content: Vec<ContentBlock>| Message {
+            role: Role::User,
+            content,
+            ..Default::default()
+        };
+        let history = vec![
+            Message::user(CAPTION.into()),
+            carries(vec![ContentBlock::Image {
+                source: fine.clone(),
+            }]),
+            carries(vec![
+                ContentBlock::Text {
+                    text: CAPTION.into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::new(
+                        ImageMediaType::Png,
+                        Arc::from(crate::image::png_base64(OVERSIZED, 30)),
+                    ),
+                },
+            ]),
+        ];
+
+        let adapted = smol::block_on(adapt_images_for_model(&model, &history));
+        assert!(matches!(adapted, Cow::Owned(_)), "the repair needs a copy");
+        assert_eq!(adapted[0].first_user_text(), Some(CAPTION));
+        let ContentBlock::Image { source } = &adapted[1].content[0] else {
+            panic!("an image nothing is wrong with must stay an image");
+        };
+        assert!(
+            Arc::ptr_eq(&source.data, &fine.data),
+            "an untouched image must not be re-encoded"
+        );
+        assert!(
+            matches!(&adapted[2].content[0], ContentBlock::Text { text } if text == CAPTION),
+            "the blocks beside a repaired one must survive"
+        );
+        let ContentBlock::Image { source } = &history[2].content[1] else {
+            panic!("history must keep its image block");
+        };
+        assert_eq!(
+            crate::image::dimensions(source),
+            (OVERSIZED, 30),
+            "only the copy going out is rewritten"
+        );
+    }
+
     #[test]
     fn adapt_images_shrinks_what_a_provider_would_refuse() {
         let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
@@ -1416,8 +1504,12 @@ mod tests {
 
     #[test_case(ThinkingConfig::Off, ThinkingConfig::Effort(Max), ThinkingConfig::Off ; "parent_off_wins_over_any_request")]
     #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Off, ThinkingConfig::Off ; "child_may_always_turn_it_off")]
+    #[test_case(ThinkingConfig::Adaptive, ThinkingConfig::Off, ThinkingConfig::Off ; "child_off_beats_an_unbounded_parent")]
     #[test_case(ThinkingConfig::Adaptive, ThinkingConfig::Effort(Max), ThinkingConfig::Effort(Max) ; "parent_adaptive_is_not_a_ceiling")]
-    #[test_case(ThinkingConfig::Effort(Minimal), ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "child_adaptive_passes_through")]
+    #[test_case(ThinkingConfig::Adaptive, ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "parent_adaptive_lets_the_child_stay_adaptive")]
+    #[test_case(ThinkingConfig::Effort(Minimal), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Minimal) ; "child_adaptive_cannot_escape_a_parent_effort")]
+    #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Max) ; "child_adaptive_yields_even_to_the_top_effort")]
+    #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Adaptive, ThinkingConfig::Budget(SMALL_BUDGET) ; "child_adaptive_cannot_escape_a_parent_budget")]
     #[test_case(ThinkingConfig::Effort(Low), ThinkingConfig::Effort(Max), ThinkingConfig::Effort(Low) ; "effort_capped_at_parent")]
     #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Effort(Low), ThinkingConfig::Effort(Low) ; "effort_lower_child_kept")]
     #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Budget(LARGE_BUDGET), ThinkingConfig::Budget(SMALL_BUDGET) ; "budget_capped_at_parent")]

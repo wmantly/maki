@@ -581,10 +581,10 @@ async fn fetch_remote_catalog_async(
     if status != 200 {
         // Drain the body so isahc can reuse the connection
         let _ = resp.text().await;
-        return Err(AgentError::Api {
+        return Err(AgentError::api(
             status,
-            message: format!("catalog fetch returned HTTP {status}"),
-        });
+            format!("catalog fetch returned HTTP {status}"),
+        ));
     }
 
     let text = resp
@@ -637,6 +637,16 @@ fn parse_models(models: &HashMap<String, schema::CatalogModel>) -> HashMap<Strin
         .collect()
 }
 
+/// A published `0` is "nobody filled this in", never a real cap. Around a sixth
+/// of models.dev carries one, mostly image, audio and embedding rows, and a few
+/// chat models on aggregator providers. Letting it through sends
+/// `"max_tokens": 0` on the wire and leaves a context window of zero, which
+/// reads as an overflow on every turn, so it is dropped here at the boundary
+/// and the usual fallbacks answer instead.
+fn published_limit(limit: Option<u32>) -> Option<u32> {
+    limit.filter(|tokens| *tokens > 0)
+}
+
 fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
     let limit = model.limit.as_ref();
     // A published `modalities` answers the vision question on its own; only a
@@ -646,8 +656,8 @@ fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
         None => model.attachment,
     };
     CatalogMeta {
-        context: limit.and_then(|l| l.context),
-        output: limit.and_then(|l| l.output),
+        context: published_limit(limit.and_then(|l| l.context)),
+        output: published_limit(limit.and_then(|l| l.output)),
         pricing: model.cost.as_ref().map(|cost| ModelPricing {
             input: cost.input.unwrap_or(0.0),
             output: cost.output.unwrap_or(0.0),
@@ -1017,7 +1027,7 @@ mod tests {
 
     use super::{
         Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, ProviderQuirks,
-        SessionRef, StateDir, available_if_warm, determine_catalog_format, quirks_for,
+        SessionRef, StateDir, available_if_warm, determine_catalog_format, parse_model, quirks_for,
     };
     use crate::manifest::ManifestRegistry;
     use crate::model::{Model, ModelInfo, ModelPricing};
@@ -1855,6 +1865,31 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// `poe/novita/glm-4.6` ships `0/0`, and a zero that survives here becomes
+    /// `"max_tokens": 0` on the wire and a window that overflows on every turn.
+    #[test_case(Some(0),       Some(0),       None,            None            ; "zero_is_not_a_limit")]
+    #[test_case(Some(0),       Some(32_768),  None,            Some(32_768)    ; "only_the_zero_half_is_dropped")]
+    #[test_case(Some(131_072), Some(32_768),  Some(131_072),   Some(32_768)    ; "real_limits_are_kept")]
+    #[test_case(None,          None,          None,            None            ; "an_absent_limit_stays_absent")]
+    fn a_published_zero_limit_is_read_as_no_limit(
+        context: Option<u32>,
+        output: Option<u32>,
+        expected_context: Option<u32>,
+        expected_output: Option<u32>,
+    ) {
+        let meta = parse_model(&CatalogModel {
+            limit: Some(CatalogLimits {
+                context,
+                input: None,
+                output,
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(meta.context, expected_context);
+        assert_eq!(meta.output, expected_output);
     }
 
     fn catalog_index(
