@@ -2189,6 +2189,7 @@ maki.fs.read({path})
 ```
 
 Read the entire file at {path} as a UTF-8 string.
+Files larger than 512 MiB return nil plus an error message.
 If the file contains bytes that are not valid UTF-8, this function throws.
 Use `read_bytes` for binary files.
 
@@ -2219,6 +2220,7 @@ maki.fs.read_bytes({path})
 ```
 
 Read the entire file at {path} as raw bytes, returned as a Luau buffer.
+Files larger than 512 MiB return nil plus an error message.
 Useful for binary files or when you need to pass the data to `maki.base64.encode`.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
@@ -3986,7 +3988,7 @@ parser language for a given filetype later with `get_lang()`.
 **Example:**
 
 ```lua
-maki.treesitter.language.register("typescript", { "ts", "tsx" })
+maki.treesitter.language.register("tsx", { "tsx", "jsx" })
 ```
 
 ---
@@ -4010,8 +4012,8 @@ a grammar with that name exists. Returns nil when nothing matches.
 **Example:**
 
 ```lua
-local lang = maki.treesitter.language.get_lang("tsx")
-if lang then print(lang) end -- "typescript"
+maki.treesitter.language.register("tsx", { "tsx", "jsx" })
+local lang = maki.treesitter.language.get_lang("jsx") -- "tsx"
 ```
 
 ---
@@ -4033,8 +4035,8 @@ Returns all filetypes that have been registered for {lang}.
 **Example:**
 
 ```lua
-local fts = maki.treesitter.language.get_filetypes("typescript")
--- { "ts", "tsx" }
+local fts = maki.treesitter.language.get_filetypes("tsx")
+-- { "tsx", "jsx" }
 ```
 
 ---
