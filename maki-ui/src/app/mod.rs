@@ -373,7 +373,7 @@ impl App {
         model_policy: Arc<ModelPolicy>,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
-        let state = SessionState::from_session(session, model, &storage, &model_policy);
+        let state = SessionState::from_session(session, model, &storage);
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let input_box = InputBox::new(
@@ -472,11 +472,6 @@ impl App {
 
     fn plan_form_active(&self) -> bool {
         self.state.mode == Mode::Plan && self.plan_form.is_visible()
-    }
-
-    pub(crate) fn update_model(&mut self, model: &Model) {
-        self.state.update_model(model);
-        persist_model(&self.storage, &self.state.session.model);
     }
 
     /// One diff per frame covers every way a model can change (the picker,
@@ -761,6 +756,14 @@ impl App {
     }
 
     /// Slash commands with descriptions, for the web command picker.
+    /// App-level model change: keep the shared session state and the persisted
+    /// startup model in step, so a model picked from the remote page or an
+    /// autocmd survives the next `maki` launch.
+    pub(crate) fn update_model(&mut self, model: &Model) {
+        self.state.update_model(model);
+        persist_model(&self.storage, &self.state.session.model);
+    }
+
     pub(crate) fn remote_commands(&mut self) -> serde_json::Value {
         let items = self
             .command_palette
