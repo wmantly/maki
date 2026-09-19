@@ -824,12 +824,26 @@ fn normalize_scope_prefix(path: &str) -> PathBuf {
 /// smuggle in the everything rule this refuses.
 pub fn is_universal_scope(pattern: &str) -> bool {
     match pattern.strip_suffix("/**") {
-        Some(prefix) => is_root(&normalize_scope_prefix(prefix)),
+        Some(prefix) => prefix_is_universal(prefix),
         None => {
             let stem = pattern.trim_end_matches('*');
             stem.len() < pattern.len() && matches!(stem, "" | "/")
         }
     }
+}
+
+/// Whether a `/**` prefix spells the whole filesystem, spelled either as the
+/// canonical path (`canonical_key`: expands `~`, resolves symlinks) or as a
+/// lexical one (`normalize_path`: collapses `.` and `..` without touching the
+/// filesystem). Each catches what the other misses: a symlink or `~` to `/` only
+/// the canonical side sees, `/tmp/../`, `/./` or `//` only the lexical side.
+/// `/private`, by contrast, is a real directory and a genuine scope.
+/// `is_universal_scope` and [`scope_matches`] both answer off this, so a root
+/// smuggled through `..`, `~` or a symlink cannot be a scoped grant in one
+/// place and a blanket allow to be refused in the other.
+fn prefix_is_universal(prefix: &str) -> bool {
+    is_root(&normalize_scope_prefix(prefix))
+        || is_root(&maki_storage::paths::normalize_path(Path::new(prefix)))
 }
 
 fn is_root(path: &Path) -> bool {
@@ -846,12 +860,12 @@ fn is_root(path: &Path) -> bool {
 /// transparently on all platforms.
 pub fn scope_matches(pattern: &str, value: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix("/**") {
-        let norm_prefix = normalize_scope_prefix(prefix);
         // A root prefix covers every scope, bash commands included. Those are
         // not paths, so a plain prefix test would miss them.
-        if is_root(&norm_prefix) {
+        if prefix_is_universal(prefix) {
             return true;
         }
+        let norm_prefix = normalize_scope_prefix(prefix);
         let norm_value = normalize_scope_prefix(value);
         return norm_value == norm_prefix || norm_value.starts_with(&norm_prefix);
     }
@@ -1059,6 +1073,19 @@ mod tests {
     #[test_case("" => false ; "empty")]
     fn universal_scope(pattern: &str) -> bool {
         is_universal_scope(pattern)
+    }
+
+    /// The canonical half of `prefix_is_universal`. Lexically the prefix is just
+    /// a tempdir; only resolving the symlink reaches the root. A `~/../..`
+    /// spelling would prove the same branch but assumes `$HOME` is set and
+    /// exactly two levels deep.
+    #[test]
+    #[cfg(unix)]
+    fn universal_scope_through_symlink_to_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("root");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert!(is_universal_scope(&format!("{}/**", link.display())));
     }
 
     #[test_case(vec!["cd /tmp", "cargo test"], vec!["cd *", "cargo *"], true ; "all_allowed")]

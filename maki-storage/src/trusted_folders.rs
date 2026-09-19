@@ -1231,6 +1231,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[cfg(unix)]
     #[test]
     fn non_utf8_paths_are_refused() {
@@ -1239,6 +1240,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let non_utf8 = dir.path().join(OsString::from_vec(vec![b'x', 0xff]));
+        // macOS 14+ (APFS) rejects non-UTF-8 names at the filesystem layer, so
+        // the test only runs where the filesystem admits the name.
         fs::create_dir(&non_utf8).unwrap();
         assert!(matches!(
             CanonicalFolder::resolve(&non_utf8),

@@ -397,13 +397,7 @@ pub(crate) const TEST_CONTEXT_WINDOW: u32 = 200_000;
 
 #[cfg(test)]
 pub(crate) fn test_pricing() -> ModelPricing {
-    ModelPricing {
-        input: 3.0,
-        output: 15.0,
-        cache_write: 3.75,
-        cache_read: 0.30,
-        fast: None,
-    }
+    ModelPricing::per_million(3.0, 15.0, 3.75, 0.30)
 }
 
 #[cfg(test)]
@@ -418,6 +412,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         supports_vision_override: Some(true),
         supports_fast_override: None,
         pricing: test_pricing(),
+        subsidised_by: None,
         discovered_free: false,
         max_output_tokens: Some(8192),
         turn_output_tokens: None,

@@ -13,7 +13,7 @@ use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
-use maki_agent::permissions::PermissionManager;
+use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
     DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
     McpSnapshotReader, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
@@ -85,6 +85,8 @@ const MULTIBYTE_ERROR_CHAR: &str = "é";
 const TRUST: &str = "/trust";
 const GATED_INIT_SOURCE: &str = "-- shipped by the project";
 const PREVIOUS_ANSWER: &str = "Previous answer to select";
+const FIRST_ASK: &str = "ask-a";
+const SECOND_ASK: &str = "ask-b";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -342,6 +344,7 @@ fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEven
         usage,
         model: model.into(),
         cost,
+        subsidised_list_cost: None,
         context_size: None,
         context_window: 0,
     }))
@@ -3247,6 +3250,44 @@ fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Recei
     (app, sub_rx, main_rx)
 }
 
+fn allow_once(ask_id: &str) -> String {
+    TaggedAnswer::new(ask_id, PermissionAnswer::AllowOnce).encode()
+}
+
+/// Subagents run in parallel and each parks its own tool call on its own ask.
+/// Every answer has to reach the subagent that asked, tagged with its own ask,
+/// or that tool call waits forever.
+#[test]
+fn concurrent_subagent_permission_requests_are_each_answered() {
+    let (first_tx, first_rx) = flume::unbounded();
+    let (second_tx, second_rx) = flume::unbounded();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    for (parent, ask, tx) in [
+        ("sub-a", FIRST_ASK, first_tx),
+        ("sub-b", SECOND_ASK, second_tx),
+    ] {
+        app.update(Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::PermissionRequest {
+                id: ask.into(),
+                tool: ToolKey::native("bash"),
+                scopes: vec!["ls".into()],
+            },
+            subagent: Some(subagent_info_with_tx(parent, RESEARCH_NAME, Some(tx))),
+            run_id: 1,
+        })));
+    }
+
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert_eq!(first_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
+    assert!(second_rx.is_empty(), "the queued ask is still unanswered");
+
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert_eq!(second_rx.try_recv().unwrap(), allow_once(SECOND_ASK));
+    assert!(!app.permission_prompt.is_open());
+}
+
 #[test]
 fn auth_required_in_subagent_shows_in_both_chats() {
     let mut app = app_with_subagent_id("sub1");
@@ -4438,7 +4479,7 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
         prompt: PACK_REVIEW_PROMPT.into(),
         plan: PackPlan::default(),
     });
-    app.permission_prompt.open(
+    app.permission_prompt.push(
         "id".into(),
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
@@ -4793,7 +4834,7 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
 #[test]
 fn ctrl_c_denies_permission_prompt() {
     let mut app = test_app();
-    app.permission_prompt.open(
+    app.permission_prompt.push(
         "id".into(),
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
@@ -5012,7 +5053,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
     open_split_window(&mut app, maki_lua::Split::Below);
     open_split_window(&mut app, maki_lua::Split::Left);
     open_split_window(&mut app, maki_lua::Split::Above);
-    app.permission_prompt.open(
+    app.permission_prompt.push(
         "perm-1".into(),
         maki_config::ToolKey::native("bash"),
         vec!["ls".into()],
@@ -5223,7 +5264,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.plan_form.on_plan_ready();
-    app.permission_prompt.open(
+    app.permission_prompt.push(
         "id".into(),
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
@@ -5237,7 +5278,8 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         })
     );
 
-    app.permission_prompt.open(
+    app.permission_prompt.close();
+    app.permission_prompt.push(
         "id".into(),
         maki_config::ToolKey::Wildcard,
         vec![],
@@ -5993,7 +6035,7 @@ fn remote_permission_answer_requires_pending_prompt() {
 #[test]
 fn remote_permission_answer_rejects_unknown_answer() {
     let mut app = test_app();
-    app.permission_prompt.open(
+    app.permission_prompt.push(
         RC_REQUEST_ID.into(),
         maki_config::ToolKey::native("bash"),
         vec![],
@@ -6010,7 +6052,7 @@ fn remote_permission_answer_rejects_unknown_answer() {
 #[test]
 fn remote_permission_answer_routes_and_closes() {
     let mut app = test_app();
-    app.permission_prompt.open(
+    app.permission_prompt.push(
         RC_REQUEST_ID.into(),
         maki_config::ToolKey::native("bash"),
         vec![],

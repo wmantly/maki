@@ -10,12 +10,14 @@ use maki_storage::id::SessionRef;
 use tracing::warn;
 
 use super::ResolvedAuth;
+use super::anthropic::shared;
+use super::catalog;
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::manifest::ManifestRegistry;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider, ProviderKind};
+use crate::provider::{BoxFuture, Provider};
 use crate::providers::Timeouts;
+use crate::spec::{ProviderRegistry, ProviderSpec};
 use crate::types::ThinkingFallback;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -30,24 +32,27 @@ static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: "custom",
 };
 
-fn protocol_kind(protocol: Protocol) -> ProviderKind {
-    match protocol {
-        Protocol::Openai | Protocol::OpenaiResponses => ProviderKind::OpenAi,
-        Protocol::Anthropic => ProviderKind::Anthropic,
-        Protocol::Google => ProviderKind::Google,
-    }
+/// The native provider a custom slug borrows its codec and fallbacks from.
+/// Resolved through [`ProviderRegistry::get`], never `for_slug`, so the lookup
+/// cannot recurse back into here.
+fn protocol_spec(protocol: Protocol) -> Option<&'static ProviderSpec> {
+    ProviderRegistry::get(match protocol {
+        Protocol::Openai | Protocol::OpenaiResponses => super::openai::SLUG,
+        Protocol::Anthropic => super::anthropic::SLUG,
+        Protocol::Google => super::google::SLUG,
+    })
 }
 
 /// Builtins win their slug in `from_spec`/`create`, so every custom path skips
-/// them. Key off the manifest (every builtin), not `builtin_provider`, which
+/// them. Key off the spec (every builtin), not `builtin_provider`, which
 /// omits the `opencode` slugs and would let them shadow the builtin.
 fn is_builtin_slug(slug: &str) -> bool {
-    ManifestRegistry::get(slug).is_some()
+    ProviderRegistry::get(slug).is_some()
 }
 
-pub fn base_kind(slug: &str) -> Option<ProviderKind> {
+pub fn base_spec(slug: &str) -> Option<&'static ProviderSpec> {
     let config = ProvidersConfig::load();
-    Some(protocol_kind(config.get(slug)?.protocol?))
+    protocol_spec(config.get(slug)?.protocol?)
 }
 
 fn resolve_custom_auth(slug: &str) -> Result<ResolvedAuth, AgentError> {
@@ -67,30 +72,26 @@ fn resolve_custom_auth(slug: &str) -> Result<ResolvedAuth, AgentError> {
 }
 
 pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    let kind = base_kind(slug).ok_or_else(|| AgentError::Config {
-        message: format!("unknown custom provider '{slug}'"),
-    })?;
+    let config = ProvidersConfig::load();
+    let protocol = config
+        .get(slug)
+        .and_then(|def| def.protocol)
+        .ok_or_else(|| AgentError::Config {
+            message: format!("unknown custom provider '{slug}'"),
+        })?;
     let resolved = resolve_custom_auth(slug)?;
     let auth = Arc::new(Mutex::new(resolved));
 
-    let config = ProvidersConfig::load();
-    let protocol = resolve_protocol(slug, config.get(slug)).unwrap_or(Protocol::Openai);
-
-    match kind {
-        ProviderKind::Anthropic => Ok(Box::new(super::anthropic::Anthropic::with_auth(
+    match protocol {
+        Protocol::Anthropic => Ok(Box::new(super::anthropic::Anthropic::with_auth(
             auth, timeouts,
         ))),
-        ProviderKind::OpenAi => Ok(Box::new(CustomOpenAiProvider {
+        Protocol::Openai | Protocol::OpenaiResponses => Ok(Box::new(CustomOpenAiProvider {
             compat: OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, timeouts),
             auth,
             protocol,
         })),
-        ProviderKind::Google => Ok(Box::new(super::google::Google::with_auth(auth, timeouts))),
-        _ => Err(AgentError::Config {
-            message: format!(
-                "unsupported protocol for custom provider '{slug}', only openai/anthropic/google are supported"
-            ),
-        }),
+        Protocol::Google => Ok(Box::new(super::google::Google::with_auth(auth, timeouts))),
     }
 }
 
@@ -100,13 +101,34 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
     }
     let config = ProvidersConfig::load();
     let def = config.get(slug)?;
-    let kind = protocol_kind(def.protocol?);
-    Some(model_from_def(def, kind, slug, model_id))
+    let base = protocol_spec(def.protocol?)?;
+    Some(model_from_def(def, base, slug, model_id))
+}
+
+/// The model id to price a subsidised-but-unpriced model from the Anthropic
+/// catalog under, or `None` when the fallback does not apply. Gated on the
+/// base spec the protocol resolved to: only Anthropic-protocol providers serve
+/// Anthropic models, so any other base must not get Anthropic catalog rates.
+/// `-1m` context variants price the same as their base model.
+fn catalog_fallback_id<'a>(
+    base: &'static ProviderSpec,
+    pricing: &ModelPricing,
+    subsidised: bool,
+    model_id: &'a str,
+) -> Option<&'a str> {
+    (pricing.is_zero() && subsidised && base.slug == super::anthropic::SLUG)
+        .then(|| shared::strip_long_context(model_id))
 }
 
 /// Build a model from an already-loaded provider definition so tier resolution
 /// and id lookup can share one `providers.toml` read instead of loading twice.
-fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &str) -> Model {
+fn model_from_def(
+    def: &ProviderDef,
+    base: &'static ProviderSpec,
+    slug: &str,
+    model_id: &str,
+) -> Model {
+    let subsidy_source = def.subsidised_by.as_deref();
     let declared = def.models.iter().find(|m| m.id == model_id);
     let tier = declared
         .map(|m| ModelTier::from(m.tier))
@@ -116,15 +138,21 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
     let max_output_tokens = declared
         .and_then(|m| m.max_output_tokens)
         .or_else(|| discovered.and_then(|d| d.max_output_tokens))
-        .or_else(|| kind.fallback_max_output());
+        .or(base.fallback_max_output);
+    // Same precedence as the builtin path ([`Model::from_base`]): the `-1m`
+    // suffix only stands in for a window nothing more specific reported, so a
+    // proxy that answers /v1/models with its real cap still wins. Without this
+    // arm a -1m variant on a custom Anthropic slug (cliproxy on Claude Max)
+    // would read back as the 200K protocol default.
     let context_window = declared
         .and_then(|m| m.context_window)
         .or_else(|| discovered.and_then(|d| d.context_window))
-        .unwrap_or_else(|| kind.fallback_context_window());
+        .or_else(|| shared::long_context_window(model_id))
+        .unwrap_or(base.fallback_context_window);
     let supports_tool_examples_override = declared.and_then(|m| m.supports_tool_examples);
     let declared_fields = declared.and_then(|m| m.thinking_fields.as_ref());
     // Resolved here rather than left to `Model::supports_thinking`, which would
-    // reach the same manifest through `custom::base_kind` and so re-read
+    // reach the same spec through `custom::base_spec` and so re-read
     // providers.toml on every call, and would answer from whatever the builtin
     // slug discovered for a colliding model id.
     let thinking_override = ThinkingSupport::from_flags(
@@ -132,7 +160,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
             .and_then(|m| m.supports_thinking)
             // Spelling out how a model thinks is as good as saying that it does.
             .or_else(|| declared_fields.map(|_| true))
-            .or_else(|| ManifestRegistry::get(&kind.to_string()).map(|m| m.supports_thinking)),
+            .or(Some(base.supports_thinking)),
         declared.and_then(|m| m.requires_thinking).unwrap_or(false),
     );
     // Only the openai chat path merges the fragments into the body: the
@@ -167,16 +195,28 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
                 }),
         })
         .unwrap_or_default();
+    // A subsidised provider (Claude Max via cliproxy) rarely quotes its own
+    // rates -- it is free at the point of use -- so fall back to the
+    // published list price purely as the reference shown alongside the $0
+    // bill.
+    let mut pricing = pricing;
+    if let Some(base_id) = catalog_fallback_id(base, &pricing, subsidy_source.is_some(), model_id)
+        && let Some(meta) = catalog::model_meta_if_available(super::anthropic::SLUG, base_id)
+        && let Some(list) = meta.pricing
+    {
+        pricing = list;
+    }
     Model {
         id: model_id.to_string(),
         provider: Arc::from(slug),
         tier,
-        family: kind.family(),
+        family: base.family,
         supports_tool_examples_override,
         thinking_override,
         supports_vision_override,
         supports_fast_override: None,
         pricing,
+        subsidised_by: subsidy_source.map(Arc::from),
         discovered_free: false,
         max_output_tokens,
         turn_output_tokens: None,
@@ -209,9 +249,9 @@ fn declared_specs_from(config: &ProvidersConfig) -> Vec<String> {
 /// Outcome of resolving a tier against `providers.toml` in a single read.
 pub enum TierLookup {
     Model(Model),
-    /// Provider exists but declares no model at this tier; carries the base kind
-    /// so the caller can inherit the base protocol's default.
-    NoModelForTier(ProviderKind),
+    /// Provider exists but declares no model at this tier; carries the base
+    /// spec so the caller can inherit the base protocol's default.
+    NoModelForTier(&'static ProviderSpec),
     Unknown,
 }
 
@@ -228,10 +268,12 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
     let Some(protocol) = def.protocol else {
         return TierLookup::Unknown;
     };
-    let kind = protocol_kind(protocol);
+    let Some(base) = protocol_spec(protocol) else {
+        return TierLookup::Unknown;
+    };
     match def.models.iter().find(|m| ModelTier::from(m.tier) == tier) {
-        Some(declared) => TierLookup::Model(model_from_def(def, kind, slug, &declared.id)),
-        None => TierLookup::NoModelForTier(kind),
+        Some(declared) => TierLookup::Model(model_from_def(def, base, slug, &declared.id)),
+        None => TierLookup::NoModelForTier(base),
     }
 }
 
@@ -350,6 +392,14 @@ mod tests {
     const FIELDS_MODEL: &str =
         r#"{"id":"m","thinking_fields":{"high":{"reasoning_effort":"xhigh"}}}"#;
 
+    fn openai_spec() -> &'static ProviderSpec {
+        ProviderRegistry::get(super::super::openai::SLUG).unwrap()
+    }
+
+    fn anthropic_spec() -> &'static ProviderSpec {
+        ProviderRegistry::get(super::super::anthropic::SLUG).unwrap()
+    }
+
     fn openai_def(model_id: &str) -> ProviderDef {
         serde_json::from_str(&format!(
             r#"{{"protocol":"openai","models":[{{"id":"{model_id}"}}]}}"#
@@ -398,7 +448,7 @@ mod tests {
         );
 
         let def = openai_def(model_id);
-        let model = model_from_def(&def, ProviderKind::OpenAi, slug, model_id);
+        let model = model_from_def(&def, openai_spec(), slug, model_id);
         assert_eq!(model.context_window, expected_window);
         assert_eq!(model.max_output_tokens, Some(expected_output));
     }
@@ -430,7 +480,7 @@ mod tests {
             r#"{{"protocol":"openai","models":[{model_json}]}}"#
         ))
         .unwrap();
-        let model = model_from_def(&def, ProviderKind::OpenAi, "custom-gw", "m");
+        let model = model_from_def(&def, openai_spec(), "custom-gw", "m");
         let mut body = json!({"model": "m"});
         ThinkingConfig::Effort(High).apply_thinking(&mut body, &model, ThinkingFallback::None);
         assert_eq!(body, expected);
@@ -447,8 +497,83 @@ mod tests {
             r#"{{"protocol":"{protocol}","models":[{FIELDS_MODEL}]}}"#
         ))
         .unwrap();
-        let kind = protocol_kind(def.protocol.unwrap());
-        let model = model_from_def(&def, kind, "custom-gw", "m");
+        let base = protocol_spec(def.protocol.unwrap()).unwrap();
+        let model = model_from_def(&def, base, "custom-gw", "m");
         assert_eq!(model.thinking_fields.is_some(), kept);
+    }
+
+    use crate::TokenUsage;
+
+    fn subsidised_def(protocol: &str, model_id: &str) -> ProviderDef {
+        serde_json::from_str(&format!(
+            r#"{{"protocol":"{protocol}","subsidised_by":"Max","models":[{{"id":"{model_id}"}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_fallback_only_for_unpriced_subsidised_anthropic() {
+        let zero = ModelPricing::ZERO;
+        assert_eq!(
+            catalog_fallback_id(anthropic_spec(), &zero, true, "claude-x"),
+            Some("claude-x")
+        );
+        // `-1m` context variants price the same as their base model.
+        assert_eq!(
+            catalog_fallback_id(anthropic_spec(), &zero, true, "claude-x-1m"),
+            Some("claude-x")
+        );
+        // Another protocol must never pick up Anthropic catalog rates.
+        assert_eq!(
+            catalog_fallback_id(openai_spec(), &zero, true, "claude-x"),
+            None
+        );
+        // Declared/discovered rates win over the catalog.
+        let priced = ModelPricing::per_million(3.0, 15.0, 0.0, 0.0);
+        assert_eq!(
+            catalog_fallback_id(anthropic_spec(), &priced, true, "claude-x"),
+            None
+        );
+        // No subsidy, no reference price to backfill.
+        assert_eq!(
+            catalog_fallback_id(anthropic_spec(), &zero, false, "claude-x"),
+            None
+        );
+    }
+
+    // The subsidy is stamped whichever path supplied the rates, and an
+    // unpriced non-Anthropic model must not report a false $0 bill.
+    #[test]
+    fn subsidised_def_stamps_declared_pricing() {
+        let mut def = subsidised_def("openai", "my-model");
+        def.models[0].pricing_input = Some(3.0);
+        def.models[0].pricing_output = Some(15.0);
+        let model = model_from_def(&def, openai_spec(), "my-proxy", "my-model");
+        assert_eq!(model.subsidy_source(), Some("Max"));
+        assert_eq!(model.pricing.input, 3.0);
+        let usage = TokenUsage {
+            input: 1_000_000,
+            output: 0,
+            cache_creation: 0,
+            cache_read: 0,
+            ..Default::default()
+        };
+        assert_eq!(model.billed_cost(&usage, false), Some(0.0));
+    }
+
+    #[test]
+    fn subsidised_def_without_pricing_stays_unpriced() {
+        let def = subsidised_def("openai", "my-model");
+        let model = model_from_def(&def, openai_spec(), "my-proxy", "my-model");
+        assert_eq!(model.subsidy_source(), Some("Max"));
+        assert!(model.pricing.is_zero());
+        let usage = TokenUsage {
+            input: 1_000_000,
+            output: 0,
+            cache_creation: 0,
+            cache_read: 0,
+            ..Default::default()
+        };
+        assert_eq!(model.billed_cost(&usage, false), None);
     }
 }

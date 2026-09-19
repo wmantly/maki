@@ -828,6 +828,7 @@ mod tests {
             },
             model: "test-model".into(),
             cost,
+            subsidised_list_cost: None,
             context_size,
             context_window,
         }
