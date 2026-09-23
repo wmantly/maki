@@ -4,6 +4,12 @@ pub mod agent;
 pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
+pub mod file_index;
+pub use file_index::{
+    FILE_MATCH_CONFIG, FileIndex, FileMatch, FileQuery, FileReader, Ranked, WalkEnd,
+    byte_highlights, cancel_walks, file_haystack, file_haystack_owned, file_index, file_pattern,
+    invalidate_for, on_walk_end, resolved_index,
+};
 pub mod headless;
 pub mod mailbox;
 pub mod mcp;
@@ -12,11 +18,12 @@ pub use mcp::protocol::PromptRole;
 pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
 };
+pub mod session;
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
-    SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
-    is_instruction_file,
+    ModelSlot, RunContext, RunContextBuilder, SharedMessages, UNAVAILABLE_RESULT,
+    close_dangling_tool_calls, find_subdirectory_instructions, is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use mailbox::{MailboxError, SessionMailbox};
@@ -41,7 +48,7 @@ pub use types::{
     GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger, RunTotals,
     SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor, SpanStyle,
     SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent, event_stream,
+    TurnCompleteEvent, UiWaker, event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

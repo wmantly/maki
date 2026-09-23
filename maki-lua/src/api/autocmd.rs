@@ -150,10 +150,12 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 /// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-/// `"TaskFocusChanged"`, and `"ModelChanged"`. Plugins can also fire their
-/// own events with `exec_autocmds`.
+/// `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`, and
+/// `"FileIndexReady"`. Plugins can also fire their own events with
+/// `exec_autocmds`.
 ///
-/// Every host event carries `data.session_id`. For `"SessionReset"` and
+/// Every host event carries `data.session_id` except `"FileIndexReady"`,
+/// which is about a directory rather than a session. For `"SessionReset"` and
 /// `"SessionEnd"` that is the session being left behind, the other events
 /// name the session now running or focused. What each event adds:
 ///
@@ -170,7 +172,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"CompactionDone"`: `data.context_size_before`,
 ///   `data.context_size_after`, and `data.context_window`.
 /// - `"PlanReady"`: `data.path`, the absolute path of the plan file the
-///   agent just wrote. Fires once per draft.
+///   agent just wrote. Fires once per draft. Plan state is per session, so
+///   pass `data.session_id` to `maki.plan.read`.
 /// - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
 ///   first focus at startup.
 /// - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
@@ -186,6 +189,25 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
 ///   plus `data.previous_spec`. Picking the model already in use stays
 ///   quiet, and so does startup.
+/// - `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
+///   chat input as `maki.ui.input` reports it. `data.source` is the plugin
+///   name when that plugin's `maki.ui.input_edit` was the only writer this
+///   frame, and nil otherwise (including when the user moved the caret), so
+///   ignoring your own name never drops a change. `data.cursor_only` is true
+///   when only the caret moved. Handlers that only care about the text
+///   should return early on it. Fires at most once per frame, and only when
+///   the text or caret changed. Focusing another session republishes that
+///   session's input.
+/// - `"FileIndexReady"`: `data.root`, the absolute directory that was
+///   walked, `data.files`, how many paths the walk left, and `data.crashed`
+///   and `data.truncated`, the two ways that list is not the whole tree.
+///   Fires once per walk that ends, whatever `maki.fs.fuzzy_files` or the
+///   `Ctrl+S` picker started it, so a plugin ranking files asks again
+///   instead of polling. A walk cancelled before it ended stays quiet.
+///   `data.root` is absent for a directory with no UTF-8 spelling, and so is
+///   the `root` of the call that asked for the walk, so a plugin matching
+///   the two takes an event without a root as a reason to ask again. Asking
+///   again only ever re-reads the root the plugin passed.
 ///
 /// `"TurnEnd"` fires once per turn and only for the main session, so
 /// subagent turns never show up. A manual `/compact` ends its run without

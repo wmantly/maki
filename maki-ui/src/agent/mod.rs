@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use maki_agent::permissions::PermissionManager;
+use maki_agent::session::Resumed;
 use maki_agent::{
     AgentConfig, CancelMap, Envelope, HistorySnapshot, McpCommand, McpConfigErrors, McpHandle,
     McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
@@ -18,8 +19,7 @@ use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
 
 use self::run_cancels::RunCancels;
-use maki_providers::provider::Provider;
-use maki_providers::{Message, Model};
+use maki_providers::Message;
 use tracing::{info, warn};
 
 use crate::app::App;
@@ -27,11 +27,7 @@ use crate::app::App;
 use self::agent_loop::AgentLoop;
 pub(crate) use self::model_slots::ModelSlots;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
-
-pub(crate) struct ModelSlot {
-    pub(crate) model: Model,
-    pub(crate) provider: Arc<dyn Provider>,
-}
+pub(crate) use maki_agent::ModelSlot;
 
 /// Input channels (`answer_tx`, `queue`) are per-agent, so an old loop can
 /// never steal new input. The output channel (`agent_tx`/`agent_rx`) is
@@ -51,7 +47,7 @@ pub(crate) struct AgentHandles {
     cancels: Arc<RunCancels>,
     subagent_cancels: Arc<CancelMap<String>>,
     model_policy: Arc<ModelPolicy>,
-    mailbox: Option<SessionMailbox>,
+    mailbox: SessionMailbox,
     task: smol::Task<()>,
 }
 
@@ -61,12 +57,10 @@ impl AgentHandles {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
-        initial_history: Vec<Message>,
-        initial_context_size: u32,
+        resumed: Resumed,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
-        session_id: Option<SessionRef>,
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
         mcp_handle: Option<McpHandle>,
@@ -76,14 +70,12 @@ impl AgentHandles {
         spawn_agent_internal(
             flume::unbounded(),
             model_slot,
-            initial_history,
-            initial_context_size,
+            resumed,
             config,
             tool_output_lines,
             permissions,
             mcp_handle,
             mcp_config_errors,
-            session_id,
             timeouts,
             lua_handle,
             model_policy,
@@ -132,10 +124,7 @@ impl AgentHandles {
     }
 
     pub(crate) fn claim_mailbox_wake(&self) -> Vec<Message> {
-        self.mailbox
-            .as_ref()
-            .map(SessionMailbox::claim_wake)
-            .unwrap_or_default()
+        self.mailbox.claim_wake()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -160,16 +149,19 @@ impl AgentHandles {
         let new = spawn_agent_internal(
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
-            history,
-            // A respawn carries the app's last reported count across, so the
-            // next request is not left guessing at its own prompt.
-            app.state.context_size,
+            Resumed {
+                id: SessionRef::from(app.state.session.id),
+                history,
+                // A respawn carries the app's last reported count across, so
+                // the next request is not left guessing at its own prompt.
+                context_size: app.state.context_size,
+                session: None,
+            },
             config,
             tool_output_lines,
             permissions,
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
-            Some(SessionRef::from(app.state.session.id)),
             self.timeouts,
             lua_handle,
             Arc::clone(&self.model_policy),
@@ -225,14 +217,12 @@ pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) {
 fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
     model_slot: &Arc<ArcSwap<ModelSlot>>,
-    initial_history: Vec<Message>,
-    initial_context_size: u32,
+    resumed: Resumed,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
-    session_id: Option<SessionRef>,
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
@@ -247,16 +237,13 @@ fn spawn_agent_internal(
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let cancels = RunCancels::new();
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
-    let mailbox = session_id
-        .as_ref()
-        .map(|session_id| SessionMailbox::register(session_id.id()));
+    let mailbox = SessionMailbox::register(resumed.id.id());
 
     let agent_loop = AgentLoop::new(
         Arc::clone(model_slot),
         config,
         tool_output_lines,
-        initial_history,
-        initial_context_size,
+        resumed,
         Arc::clone(&shared_history),
         Arc::clone(&btw_system),
         mcp_handle.clone(),
@@ -265,7 +252,6 @@ fn spawn_agent_internal(
         answer_rx,
         queue_rx,
         Arc::clone(&cancels),
-        session_id,
         mailbox.clone(),
         timeouts,
         lua_handle,
@@ -300,9 +286,9 @@ mod tests {
 
     use maki_agent::{AgentEvent, AgentInput, AgentMode};
     use maki_config::{PermissionsConfig, ProjectConfig};
-    use maki_providers::provider::BoxFuture;
+    use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+        AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
     };
 
     use super::shared_queue::{QueueItem, QueuedInput};
@@ -379,12 +365,13 @@ mod tests {
         ));
         let handles = AgentHandles::spawn(
             model_slot,
-            initial_history,
-            0,
+            Resumed {
+                history: initial_history,
+                ..Resumed::fresh()
+            },
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
-            None,
             maki_providers::Timeouts::default(),
             EventHandle::disconnected_for_test(),
             None,

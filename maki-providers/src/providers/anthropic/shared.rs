@@ -146,7 +146,7 @@ pub(crate) struct SystemBlock<'a> {
 }
 
 #[derive(Serialize)]
-pub(super) struct WireContentBlock<'a> {
+pub(crate) struct WireContentBlock<'a> {
     #[serde(flatten)]
     pub inner: &'a ContentBlock,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -154,18 +154,28 @@ pub(super) struct WireContentBlock<'a> {
 }
 
 #[derive(Serialize)]
-pub(super) struct WireMessage<'a> {
+pub(crate) struct WireMessage<'a> {
     pub role: &'a Role,
     pub content: Vec<WireContentBlock<'a>>,
 }
 
-/// The API rejects blank text blocks, and messages with no block at all, so
-/// blanks go and a message left bare falls back to the marker.
+/// The API rejects blank text blocks and thinking it did not sign (e.g. an
+/// OpenAI reasoning summary from earlier in the session).
+fn is_replayable(block: &ContentBlock) -> bool {
+    match block {
+        ContentBlock::Text { text } => !text.trim().is_empty(),
+        ContentBlock::Thinking { signature, .. } => signature.is_some(),
+        _ => true,
+    }
+}
+
+/// A message left with no block at all is rejected too, so it falls back to
+/// the marker.
 fn wire_content(msg: &Message) -> Vec<WireContentBlock<'_>> {
     let mut content: Vec<WireContentBlock<'_>> = msg
         .content
         .iter()
-        .filter(|block| !matches!(block, ContentBlock::Text { text } if text.trim().is_empty()))
+        .filter(|block| is_replayable(block))
         .map(|inner| WireContentBlock {
             inner,
             cache_control: None,
@@ -181,30 +191,31 @@ fn wire_content(msg: &Message) -> Vec<WireContentBlock<'_>> {
     content
 }
 
-pub(super) fn build_wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> {
-    let len = messages.len();
-
+/// The single Anthropic-protocol message encoder; every provider speaking
+/// that protocol must go through it.
+pub(crate) fn wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> {
     messages
         .iter()
-        .enumerate()
-        .map(|(msg_idx, msg)| {
-            let mut content = wire_content(msg);
-
-            // The API rejects `cache_control` on thinking blocks, so walk back to
-            // the last block that can carry it. All thinking means no breakpoint,
-            // which beats a fatal one.
-            if msg_idx + MESSAGE_CACHE_BREAKPOINTS >= len
-                && let Some(block) = content.iter_mut().rfind(|b| !b.inner.is_thinking())
-            {
-                block.cache_control = Some(EPHEMERAL);
-            }
-
-            WireMessage {
-                role: &msg.role,
-                content,
-            }
+        .map(|msg| WireMessage {
+            role: &msg.role,
+            content: wire_content(msg),
         })
         .collect()
+}
+
+pub(super) fn build_wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> {
+    let mut wire = wire_messages(messages);
+    let first_cached = wire.len().saturating_sub(MESSAGE_CACHE_BREAKPOINTS);
+
+    // The API rejects `cache_control` on thinking blocks, so walk back to
+    // the last block that can carry it. All thinking means no breakpoint,
+    // which beats a fatal one.
+    for msg in &mut wire[first_cached..] {
+        if let Some(block) = msg.content.iter_mut().rfind(|b| !b.inner.is_thinking()) {
+            block.cache_control = Some(EPHEMERAL);
+        }
+    }
+    wire
 }
 
 pub(super) fn build_wire_tools(tools: &Value) -> Value {
@@ -364,6 +375,22 @@ impl EventParser {
                 if let Ok(ev) = serde_json::from_str::<MessageDeltaEvent>(data) {
                     if let Some(u) = ev.usage {
                         self.usage.output = u.output_tokens;
+                        // Gateways like Bifrost send zeros in message_start and the real
+                        // counts here. The first-party API often leaves these fields out, and
+                        // serde turns a missing field into 0, so a zero must not wipe what
+                        // message_start gave us.
+                        for (dst, src) in [
+                            (&mut self.usage.input, u.input_tokens),
+                            (&mut self.usage.cache_read, u.cache_read_input_tokens),
+                            (
+                                &mut self.usage.cache_creation,
+                                u.cache_creation_input_tokens,
+                            ),
+                        ] {
+                            if src > 0 {
+                                *dst = src;
+                            }
+                        }
                     }
                     if let Some(d) = ev.delta {
                         self.stop_reason = d

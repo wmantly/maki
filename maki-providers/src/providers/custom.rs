@@ -1,10 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use flume::Sender;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use maki_config::providers::{
-    Protocol, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url, resolve_protocol,
+    Protocol, ProviderDef, ProvidersConfig, ThinkingFields, resolve_api_key_env, resolve_base_url,
+    resolve_protocol,
 };
 use maki_storage::id::SessionRef;
 use tracing::warn;
@@ -18,7 +19,7 @@ use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, Think
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::Timeouts;
 use crate::spec::{ProviderRegistry, ProviderSpec};
-use crate::types::ThinkingFallback;
+use crate::types::{ThinkingConfig, ThinkingFallback};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -31,6 +32,16 @@ static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     include_stream_usage: true,
     provider_name: "custom",
 };
+
+/// What an `openai` model without `thinking_fields` spells, which is what the
+/// chat path sent before the fields existed. GLM and Kimi style gateways reason
+/// unless told otherwise, and this is how they are told.
+static UNDECLARED_THINKING_FIELDS: LazyLock<ThinkingFields> = LazyLock::new(|| ThinkingFields {
+    off: json!({"thinking": {"type": "disabled"}})
+        .as_object()
+        .cloned(),
+    ..ThinkingFields::default()
+});
 
 /// The native provider a custom slug borrows its codec and fallbacks from.
 /// Resolved through [`ProviderRegistry::get`], never `for_slug`, so the lookup
@@ -331,6 +342,16 @@ fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
     }
 }
 
+/// A model without `thinking_fields` goes through the same merge as one with
+/// them, so what it sends lives in [`UNDECLARED_THINKING_FIELDS`].
+fn apply_chat_thinking(thinking: ThinkingConfig, body: &mut Value, model: &Model) {
+    let fields = model
+        .thinking_fields
+        .as_deref()
+        .unwrap_or(&UNDECLARED_THINKING_FIELDS);
+    thinking.apply_fields(body, model, fields, ThinkingFallback::None);
+}
+
 struct CustomOpenAiProvider {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
@@ -366,8 +387,7 @@ impl Provider for CustomOpenAiProvider {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking
-                .apply_thinking(&mut body, model, ThinkingFallback::None);
+            apply_chat_thinking(opts.thinking, &mut body, model);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
@@ -383,11 +403,9 @@ impl Provider for CustomOpenAiProvider {
 #[cfg(test)]
 mod tests {
     use maki_storage::sessions::Effort::High;
-    use serde_json::json;
     use test_case::test_case;
 
     use super::*;
-    use crate::types::ThinkingConfig;
 
     const FIELDS_MODEL: &str =
         r#"{"id":"m","thinking_fields":{"high":{"reasoning_effort":"xhigh"}}}"#;
@@ -471,18 +489,27 @@ mod tests {
 
     /// A custom `openai` entry is the one place a user can hand us a model
     /// with its own thinking words, so the declaration has to reach the body.
-    /// A gateway that declares nothing, LiteLLM and vLLM included, keeps
-    /// sending what it always sent.
-    #[test_case(r#"{"id":"m"}"#, json!({"model": "m"}) ; "undeclared_model_sends_nothing")]
-    #[test_case(FIELDS_MODEL, json!({"model": "m", "reasoning_effort": "xhigh"}) ; "declared_level_merges")]
-    fn custom_openai_thinking_is_fields_only(model_json: &str, expected: Value) {
+    /// A model that declares nothing keeps the v0.5.5 body: the disabled block
+    /// when off, nothing when on. Declaring fields replaces that wholesale, so
+    /// a mode left out sends nothing.
+    #[test_case(r#"{"id":"m"}"#, ThinkingConfig::Off, json!({"model": "m", "thinking": {"type": "disabled"}}) ; "undeclared_off_sends_disabled")]
+    #[test_case(r#"{"id":"m"}"#, ThinkingConfig::Effort(High), json!({"model": "m"}) ; "undeclared_effort_sends_nothing")]
+    #[test_case(r#"{"id":"m"}"#, ThinkingConfig::Adaptive, json!({"model": "m"}) ; "undeclared_adaptive_sends_nothing")]
+    #[test_case(r#"{"id":"m"}"#, ThinkingConfig::Budget(4096), json!({"model": "m"}) ; "undeclared_budget_sends_nothing")]
+    #[test_case(FIELDS_MODEL, ThinkingConfig::Effort(High), json!({"model": "m", "reasoning_effort": "xhigh"}) ; "declared_level_merges")]
+    #[test_case(FIELDS_MODEL, ThinkingConfig::Off, json!({"model": "m"}) ; "declared_without_off_sends_nothing")]
+    fn custom_openai_chat_thinking_body(
+        model_json: &str,
+        thinking: ThinkingConfig,
+        expected: Value,
+    ) {
         let def: ProviderDef = serde_json::from_str(&format!(
             r#"{{"protocol":"openai","models":[{model_json}]}}"#
         ))
         .unwrap();
         let model = model_from_def(&def, openai_spec(), "custom-gw", "m");
         let mut body = json!({"model": "m"});
-        ThinkingConfig::Effort(High).apply_thinking(&mut body, &model, ThinkingFallback::None);
+        apply_chat_thinking(thinking, &mut body, &model);
         assert_eq!(body, expected);
     }
 

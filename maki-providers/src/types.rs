@@ -850,18 +850,9 @@ impl ThinkingConfig {
     /// What the model says about itself wins, and `fallback` covers the modes
     /// it left unsaid.
     pub fn apply_thinking(self, body: &mut Value, model: &Model, fallback: ThinkingFallback) {
-        let max = model.max_thinking_budget();
         if let Some(fields) = &model.thinking_fields
-            && let Some((fragment, keep_budget)) = declared_fragment(fields, self, max)
-            && let Some(object) = body.as_object_mut()
+            && self.apply_fields(body, model, fields, fallback)
         {
-            merge_body(object, fragment);
-            if keep_budget
-                && matches!(fallback, ThinkingFallback::BudgetField)
-                && let Budgeted::Tokens(budget) = self.request_budget(model, max)
-            {
-                body[LOCAL_BUDGET_FIELD] = json!(budget);
-            }
             return;
         }
         match fallback {
@@ -874,7 +865,7 @@ impl ThinkingConfig {
             // The model has no way to spell this mode, so the budget field
             // takes over: a request must never end up saying nothing.
             ThinkingFallback::BudgetField => {
-                let budget = match self.request_budget(model, max) {
+                let budget = match self.request_budget(model, model.max_thinking_budget()) {
                     Budgeted::Off => 0,
                     Budgeted::Adaptive => -1,
                     Budgeted::Tokens(n) => i64::from(n),
@@ -882,6 +873,32 @@ impl ThinkingConfig {
                 body[LOCAL_BUDGET_FIELD] = json!(budget);
             }
         }
+    }
+
+    /// Merges the fragment `fields` spell for this mode, and says whether they
+    /// spell it at all.
+    pub(crate) fn apply_fields(
+        self,
+        body: &mut Value,
+        model: &Model,
+        fields: &ThinkingFields,
+        fallback: ThinkingFallback,
+    ) -> bool {
+        let max = model.max_thinking_budget();
+        let Some((fragment, keep_budget)) = declared_fragment(fields, self, max) else {
+            return false;
+        };
+        let Some(object) = body.as_object_mut() else {
+            return false;
+        };
+        merge_body(object, fragment);
+        if keep_budget
+            && matches!(fallback, ThinkingFallback::BudgetField)
+            && let Budgeted::Tokens(budget) = self.request_budget(model, max)
+        {
+            body[LOCAL_BUDGET_FIELD] = json!(budget);
+        }
+        true
     }
 
     /// `max` is Google's own documented ceiling on thinking, which is a

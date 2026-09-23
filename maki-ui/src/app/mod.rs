@@ -21,12 +21,13 @@ pub(crate) mod tests;
 pub(crate) mod view;
 
 use std::collections::HashMap;
+use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::AppSession;
+use crate::OpenSession;
 use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
@@ -43,7 +44,7 @@ use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
-use crate::components::plan_form::{PlanForm, PlanFormAction};
+use crate::components::plan_form::{PlanForm, PlanFormAction, builtin_menu, builtin_rows};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
@@ -67,8 +68,9 @@ use maki_agent::{
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
-    PackCommand, PackPreparation, WinView,
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, Key, KeymapReader,
+    LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
+    PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView, is_reserved,
 };
 use maki_providers::{ContentBlock, Message, MessageKind, Model, Role, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
@@ -77,7 +79,7 @@ use maki_storage::model::persist_model;
 use serde_json::json;
 
 use crate::storage_writer::StorageWriter;
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 
 pub(crate) use crate::agent::QueuedMessage;
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
@@ -159,6 +161,29 @@ const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
+const FLASH_PLAN_ACTION_LOST: &str = "The plugin host never took that plan action";
+const FLASH_PLAN_ACTION_FAILED: &str = "That plan action did not run";
+const FLASH_PLAN_FORM_SLOW: &str = "The plugin host was slow, opened the built-in plan form";
+/// What both plan waits add on top of the host's own budget. It covers the
+/// request queue a `/reload` or a long tool call holds, plus the executor
+/// getting round to the answer, neither of which the host's deadline starts
+/// counting until it has dequeued the request.
+const PLAN_FORM_QUEUE_SLACK_SECS: u64 = 10;
+/// How long the form waits on the `ui.plan_form*` chains before it gives up
+/// and opens the built-in one. Strictly longer than [`PLAN_FORM_SLOT_DEADLINE`],
+/// the whole budget the host gives both chains, so this only ever fires for a
+/// host that never answered at all: a legitimate answer that used every second
+/// it was allowed still beats it, and the user never sees
+/// [`FLASH_PLAN_FORM_SLOW`] for a layer that behaved.
+const PLAN_FORM_ANSWER_WAIT: Duration =
+    Duration::from_secs(PLAN_FORM_SLOT_DEADLINE.as_secs() + PLAN_FORM_QUEUE_SLACK_SECS);
+/// The same bound for a picked row's handler, derived the same way from
+/// [`PLAN_ROW_HANDLER_DEADLINE`], the whole budget the host gives one. It
+/// covers a pick that never reached the host, since the host cuts a parked
+/// handler off itself, and a handler that spent every second it was allowed
+/// still beats it.
+const PLAN_ACTION_ANSWER_WAIT: Duration =
+    Duration::from_secs(PLAN_ROW_HANDLER_DEADLINE.as_secs() + PLAN_FORM_QUEUE_SLACK_SECS);
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
@@ -185,6 +210,59 @@ const ERROR_BUBBLE_MAX_CHARS: usize = 2_000;
 /// error instead of ping-ponging with the Lua thread forever.
 pub(crate) const MAX_COMMAND_DEPTH: u8 = 8;
 pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (alias cycle?)";
+
+pub(crate) const INPUT_NOT_LIVE_ERR: &str =
+    "the chat input is not on screen, so it cannot be edited";
+
+/// Who has moved the chat input since the last tick, and the buffer version
+/// that writer left behind.
+///
+/// `InputChanged` names a plugin only when that plugin was the frame's sole
+/// writer. Handlers ignore their own writes, so a frame that also carried a
+/// keystroke or another plugin's edit has to reach them unlabelled, or they
+/// drop a change they can never see again.
+///
+/// The version is what holds that rule up without every path to the value
+/// having to remember this type exists. Submit, history recall, `$EDITOR` and
+/// the rest write the whole value without passing through
+/// [`App::input_changed`], and each of them bumps the buffer's version, which
+/// strands the name on a value that is gone instead of pinning it on their
+/// write.
+///
+/// A caret the user moved sets no writer at all: only an edit passes through
+/// [`App::input_changed`], so a cursor-only frame is reported unlabelled,
+/// which is what the rule already says about a change nobody claimed.
+#[derive(Default)]
+enum InputWriter {
+    #[default]
+    Untouched,
+    Plugin(Arc<str>, u64),
+    /// The user, or two writers in one frame: nobody may ignore this one.
+    Anyone,
+}
+
+impl InputWriter {
+    fn merge(self, next: Self) -> Self {
+        match (self, next) {
+            (Self::Untouched, next) => next,
+            (Self::Plugin(name, _), Self::Plugin(next_name, version)) if name == next_name => {
+                Self::Plugin(name, version)
+            }
+            _ => Self::Anyone,
+        }
+    }
+
+    fn take(&mut self) -> Self {
+        mem::take(self)
+    }
+
+    fn into_source(self, current_version: u64) -> Option<Arc<str>> {
+        match self {
+            Self::Plugin(name, version) if version == current_version => Some(name),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Notification {
@@ -269,6 +347,52 @@ pub(super) enum PendingInput {
     },
 }
 
+/// A plan form row picked by the user, waiting on the plugin handler behind
+/// it. `pick` is the form's pick counter at the moment of the press, and an
+/// answer that comes back under a different one belongs to a form the user
+/// has already left.
+pub(super) struct PlanAction {
+    pick: u64,
+    /// The built-in outcome the row kept, which runs after the handler.
+    then: Option<PlanRowAction>,
+    deadline: Instant,
+    answer: flume::Receiver<PlanActionOutcome>,
+}
+
+/// Everything the plan form has in flight, under one owner so that no reset
+/// path can retire half of it. A menu chain and a picked row's handler both
+/// answer on the Lua thread long after the key press that started them, and
+/// the session they were asked about may be gone by then.
+#[derive(Default)]
+pub(super) struct PlanAnswers {
+    /// In flight answer from the `ui.plan_form*` chains: whether the form
+    /// opens for the draft that landed, and with which rows. Given up on
+    /// after [`PLAN_FORM_ANSWER_WAIT`].
+    pub(super) form: Option<(Instant, flume::Receiver<Option<PlanMenu>>)>,
+    /// In flight answer from a picked plugin row.
+    pub(super) action: Option<PlanAction>,
+    /// Bumped by every pick the plan form makes, and by every path that walks
+    /// away from a draft. Without it an outcome from a pick nobody waits on
+    /// any more fires a second implement prompt on top of the one already
+    /// running, or one against a session the user never picked in.
+    pick: u64,
+}
+
+impl PlanAnswers {
+    /// Retires the answers in flight and the pick they belong to, returning
+    /// the pick a new one starts at. The counter only ever moves forward, so
+    /// anything stamped with an earlier pick can only miss from here on.
+    ///
+    /// Every reset path funnels through [`App::reset_ui_chrome`], which calls
+    /// this: a new one gets the invariant for free.
+    fn abandon(&mut self) -> u64 {
+        self.form = None;
+        self.action = None;
+        self.pick += 1;
+        self.pick
+    }
+}
+
 pub enum Msg {
     Key(KeyEvent),
     Paste(String),
@@ -340,9 +464,26 @@ pub struct App {
     /// than the session's stored one: a restored session may name another
     /// model, and the event loop swaps the live one in on the first tick.
     announced_model_spec: String,
+    /// The value Lua was last told about. A fast typist would otherwise wake
+    /// every handler once per keystroke.
+    announced_input: String,
+    /// The caret Lua was last told about, diffed alongside the value so a
+    /// caret that moved on its own is reported once and a frame that moved
+    /// neither is silent.
+    announced_cursor: usize,
+    input_writer: InputWriter,
+    /// Whether this frame's tick already fired `InputChanged`, so the focus
+    /// announcement drained below it does not repeat that value. A tab that
+    /// did not tick clears it too ([`Self::tick_background`]): whatever it
+    /// holds was last announced in an earlier frame.
+    input_fired_this_frame: bool,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
+    pub(super) plan_answers: PlanAnswers,
+    /// Actions produced outside key handling, drained by the event loop. A
+    /// plan row handler answers long after the key press that started it.
+    pub(super) pending_actions: Vec<Action>,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     /// Link is reachable by browsers (tunnel registered or standalone bound).
@@ -356,7 +497,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: &Model,
-        session: AppSession,
+        session: OpenSession,
         storage: StateDir,
         available_models: Arc<ArcSwapOption<Vec<String>>>,
         mcp_reader: McpSnapshotReader,
@@ -440,9 +581,15 @@ impl App {
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             announced_model_spec: model.spec(),
+            announced_input: String::new(),
+            announced_cursor: 0,
+            input_writer: InputWriter::Untouched,
+            input_fired_this_frame: false,
             hints: Watch::seeded(hint_reader.load_full()),
             keymap_reader,
             hint_reader,
+            plan_answers: PlanAnswers::default(),
+            pending_actions: Vec::new(),
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             remote_link: false,
@@ -531,6 +678,142 @@ impl App {
         })
     }
 
+    /// What `maki.ui.input` hands to Lua: text and offsets only. The terminal
+    /// cell the caret sits in has no answer for half the modes the UI can be
+    /// in, and the line and column the cursor is on are a slice of the two
+    /// fields below, which Lua can take for itself.
+    pub(crate) fn input_snapshot(&self) -> serde_json::Value {
+        let buffer = &self.input_box.buffer;
+        serde_json::json!({
+            "session_id": self.state.session.id.to_string(),
+            "text": buffer.value(),
+            "cursor": buffer.cursor_byte(),
+            "version": buffer.version(),
+        })
+    }
+
+    /// Refuses an edit the input has moved on from: another tab now focused, a
+    /// version the buffer has left behind, or a range it has outgrown. See
+    /// [`InputBox::replace_range`].
+    ///
+    /// The version cannot stand in for the session check. The counter is per
+    /// buffer and every buffer starts at 0, so two tabs typed in about as much
+    /// collide.
+    ///
+    /// An input the user cannot see is refused too, or the text would be sent
+    /// later without ever having been seen. {area} is the terminal the answer
+    /// is worked out against; see [`App::input_live`] for what hides the box.
+    pub(crate) fn apply_input_edit(
+        &mut self,
+        edit: InputEdit,
+        area: Rect,
+    ) -> Result<serde_json::Value, String> {
+        let focused = self.state.session.id.to_string();
+        if edit.session_id != focused {
+            return Err(format!(
+                "input of session {} is not focused (session {focused} is)",
+                edit.session_id
+            ));
+        }
+        if !self.input_live(area) {
+            return Err(INPUT_NOT_LIVE_ERR.to_string());
+        }
+        let current = self.input_box.buffer.version();
+        if edit.version != current {
+            return Err(format!(
+                "input changed since version {} (it is now {current})",
+                edit.version
+            ));
+        }
+        self.input_box
+            .replace_range(edit.start, edit.stop, &edit.text, edit.cursor)?;
+        self.input_changed(InputWriter::Plugin(
+            edit.plugin,
+            self.input_box.buffer.version(),
+        ));
+        Ok(serde_json::json!(true))
+    }
+
+    /// The paths that keep the command palette in step with the input, and
+    /// the only ones that can name a writer. Submit, discard, history recall
+    /// and `$EDITOR` change the value without coming through here, and the
+    /// tick diff reports those unlabelled: the version stamped here no longer
+    /// matches what they left.
+    fn input_changed(&mut self, writer: InputWriter) {
+        self.command_palette.sync(&self.input_box.buffer.value());
+        self.input_writer = self.input_writer.take().merge(writer);
+    }
+
+    /// One event per frame at most, and only when the caret or the text
+    /// really moved, so holding a key down wakes a handler once and a frame
+    /// that moved nothing leaves it asleep.
+    ///
+    /// A caret that moved on its own fires too, with `cursor_only` set. An
+    /// input plugin anchored to what the caret is sitting in has no other way
+    /// to learn it left: a popup on an `@` mention would stay up holding
+    /// `<CR>` for a mention the user has arrowed out of.
+    fn tick_input_changed(&mut self) -> Dirty {
+        let value = self.input_box.buffer.value();
+        let cursor = self.input_box.buffer.cursor_byte();
+        self.input_fired_this_frame =
+            value != self.announced_input || cursor != self.announced_cursor;
+        if !self.input_fired_this_frame {
+            self.input_writer = InputWriter::Untouched;
+            return Dirty::NO;
+        }
+        // The value is the trigger and the writer only a label: submit,
+        // discard, history recall, a draft restored on a session switch and
+        // $EDITOR all change the value without passing a path that could set a
+        // writer flag.
+        let source = self
+            .input_writer
+            .take()
+            .into_source(self.input_box.buffer.version());
+        let cursor_only = value == self.announced_input;
+        self.announced_input = value;
+        self.announced_cursor = cursor;
+        self.fire_input_changed(source, cursor_only);
+        Dirty::NO
+    }
+
+    /// Focus moving to another tab changes what `maki.ui.input` answers
+    /// without anyone editing anything, so the tab taking focus republishes
+    /// what it holds.
+    ///
+    /// It stays quiet only when this frame's own tick already said it: the
+    /// switch is drained below the tick that opened the frame, so a tab whose
+    /// draft that tick restored has already fired the value. Comparing
+    /// against what was last announced cannot stand in for the latch. Every
+    /// tab keeps its own record, so two tabs holding the same text - an empty
+    /// one is the common case - would announce nothing, and handlers would go
+    /// on acting on the text of the tab they came from while `maki.ui.input`
+    /// already answers with this one's.
+    ///
+    /// It is never `cursor_only`: the whole input changed hands, so a handler
+    /// that only watches the text has to see it.
+    pub(crate) fn announce_input(&mut self) {
+        self.input_writer = InputWriter::Untouched;
+        if mem::take(&mut self.input_fired_this_frame) {
+            return;
+        }
+        self.announced_input = self.input_box.buffer.value();
+        self.announced_cursor = self.input_box.buffer.cursor_byte();
+        self.fire_input_changed(None, false);
+    }
+
+    fn fire_input_changed(&mut self, source: Option<Arc<str>>, cursor_only: bool) {
+        self.fire_session_autocmd(
+            "InputChanged",
+            serde_json::json!({
+                "text": self.announced_input,
+                "cursor": self.announced_cursor,
+                "version": self.input_box.buffer.version(),
+                "source": source,
+                "cursor_only": cursor_only,
+            }),
+        );
+    }
+
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
         let recents = maki_storage::model::push_recent(&self.storage, spec)
             .into_iter()
@@ -541,6 +824,12 @@ impl App {
 
     pub(crate) fn flash(&mut self, msg: String) {
         self.status_bar.flash(msg);
+    }
+
+    /// For a warning the user did not ask for, so a run that produced several
+    /// shows all of them rather than whichever was reported last.
+    pub(crate) fn queue_flash(&mut self, msg: String) {
+        self.status_bar.queue_flash(msg);
     }
 
     pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
@@ -1088,7 +1377,12 @@ impl App {
             return Some(vec![]);
         }
 
-        if self.float_mgr.handle_key(key) {
+        // A focused plugin window is the thing the user is typing into, so it
+        // goes ahead of the rest. The keys an *unfocused* window claimed are
+        // settled far below, after every modal here: a claim is up while the
+        // user works under it, and a popup that holds `<CR>` must not answer
+        // the Enter meant for the file picker opened over it.
+        if self.float_mgr.handle_focused_key(key) {
             return Some(vec![]);
         }
 
@@ -1121,10 +1415,8 @@ impl App {
                 FilePickerModalAction::Consumed => vec![],
                 FilePickerModalAction::Select(path) => {
                     self.file_picker.close();
-                    if let InputAction::PaletteSync(val) =
-                        self.input_box.handle_paste_with_spaces(&path)
-                    {
-                        self.command_palette.sync(&val);
+                    if let InputAction::Changed = self.input_box.handle_paste_with_spaces(&path) {
+                        self.input_changed(InputWriter::Anyone);
                     }
                     vec![]
                 }
@@ -1213,6 +1505,35 @@ impl App {
             return Some(self.run_builtin(BuiltinAction::PlanToggle));
         }
 
+        // The command palette is the host's overlay over the chat input, so it
+        // is answered here with the rest of them rather than below the claims:
+        // a plugin holding `<Tab>` or `<CR>` must not take them from the `/`
+        // command the user is typing into. Last in the pass, because every
+        // modal above is drawn over it.
+        //
+        // Ctrl keys pass it by, as they always did: `Ctrl+C` closes it and the
+        // rest belong to the input box and the built-in bindings. So does every
+        // key in a subagent chat, where there is no input to complete.
+        if self.is_main_chat() && !is_ctrl(&key) {
+            match self
+                .command_palette
+                .handle_key(key, &self.input_box.buffer.value())
+            {
+                CommandAction::Consumed => return Some(vec![]),
+                CommandAction::Execute(cmd) => {
+                    self.input_box.discard();
+                    return Some(self.execute_command(cmd, 0));
+                }
+                CommandAction::Complete(text) => {
+                    self.input_box.set_input(text);
+                    self.input_box.buffer.move_to_end();
+                    self.input_changed(InputWriter::Anyone);
+                    return Some(vec![]);
+                }
+                CommandAction::Passthrough => {}
+            }
+        }
+
         None
     }
 
@@ -1264,6 +1585,22 @@ impl App {
         vec![]
     }
 
+    /// One chain, in one order: `Ctrl+Z`, then the focused plugin window, then
+    /// the host's own overlays and modals, then the keys an unfocused window
+    /// claimed, then `Esc` while the agent streams, then a plugin's global
+    /// bindings, then the built-in keys.
+    ///
+    /// A focused window is above the overlays because it is the window the
+    /// user is in. A claim is below them because it is not: the popup it
+    /// belongs to is up while the user works underneath, so a modal opened
+    /// over it outranks it, and the claim comes back the moment the modal
+    /// closes. The command palette is one of those overlays, answered in
+    /// [`Self::dispatch_overlay`] with the rest, so a plugin's claim on
+    /// `<Tab>` or `<CR>` leaves the `/` command being typed alone.
+    ///
+    /// Every step either answers the key or passes it on untouched, and no key
+    /// is ever handed back after the fact, because a keystroke replayed into a
+    /// UI that has moved on lands somewhere the user never aimed it.
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
         self.clear_selection_unless_pending_copy();
 
@@ -1275,9 +1612,11 @@ impl App {
             return actions;
         }
 
-        if !(self.status == Status::Streaming && is_streaming_stop_key(key))
-            && self.dispatch_override(key)
-        {
+        if self.float_mgr.handle_claimed_key(key) {
+            return vec![];
+        }
+
+        if !self.reserved_by_host(key) && self.dispatch_override(key) {
             return vec![];
         }
 
@@ -1317,17 +1656,46 @@ impl App {
         self.handle_main_chat_key(key)
     }
 
+    /// The keys the host answers before any plugin *binding* sees them.
+    ///
+    /// `Ctrl+C` is how the user leaves, and the app has to stay leavable
+    /// whatever a plugin bound or how badly its handler is stuck. `Ctrl+Z` is
+    /// resolved above every step of the chain, for the same reason. Both come
+    /// from [`maki_lua::RESERVED_KEYS`], the list `maki.keymap.set` refuses
+    /// and the list a window's `keys` refuses, so neither can be bound nor
+    /// claimed.
+    ///
+    /// A focused plugin window is handed `Ctrl+C` all the same, before this
+    /// runs: being handed every key is what focus is, and the bundled pickers
+    /// answer it by closing, which is how the user gets back to a chat they
+    /// can quit from. `Ctrl+Z` is the one key not even a focused window sees,
+    /// because suspending cannot wait on a plugin reading its events.
+    ///
+    /// `Esc` joins them while the agent runs, because stopping a turn is the
+    /// other thing a user cannot be made to wait for. A popup that put
+    /// `Esc close` in its own footer is already past this: an unfocused window
+    /// takes its claims in [`FloatManager::handle_claimed_key`], which runs
+    /// above, so the popup takes the first `Esc` and the next one, with the
+    /// popup gone, arms the cancel.
+    fn reserved_by_host(&self, key: KeyEvent) -> bool {
+        is_reserved(key) || (self.status == Status::Streaming && key.code == KeyCode::Esc)
+    }
+
+    /// Whether a plugin binding claimed {key}. The binding the keymap matched
+    /// travels with the request, so one dropped on the Lua thread cannot leave
+    /// this having consumed a key nothing will act on.
+    ///
+    /// `false` is the only fall-through there is, and it is answered here, in
+    /// the keystroke the user pressed: no binding matched, the plugin has too
+    /// many callbacks in flight, or its load is gone. The built-in binding
+    /// then runs below, with the UI exactly as the user left it. Nothing comes
+    /// back from the Lua thread to be replayed. A key no notation names is one
+    /// no plugin could have bound, so it falls through too.
     fn dispatch_override(&self, key: KeyEvent) -> bool {
-        let snap = self.keymap_reader.load();
-        for entry in &snap.entries {
-            if entry.key == key.code
-                && entry.modifiers == key.modifiers
-                && self.lua_event_handle.run_keybind_callback(entry.id)
-            {
-                return true;
-            }
-        }
-        false
+        Key::from_event(key).is_some_and(|k| {
+            self.keymap_reader
+                .dispatch(k, |bind| self.lua_event_handle.run_keybind_callback(bind))
+        })
     }
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -1348,35 +1716,17 @@ impl App {
                 return self.run_builtin(BuiltinAction::FilePicker);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
-            } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
-                self.command_palette.sync(&val);
+            } else if let InputAction::Changed = self.input_box.handle_key(key) {
+                self.input_changed(InputWriter::Anyone);
             }
             return vec![];
-        }
-
-        match self
-            .command_palette
-            .handle_key(key, &self.input_box.buffer.value())
-        {
-            CommandAction::Consumed => return vec![],
-            CommandAction::Execute(cmd) => {
-                self.input_box.discard();
-                return self.execute_command(cmd, 0);
-            }
-            CommandAction::Complete(text) => {
-                self.command_palette.sync(&text);
-                self.input_box.set_input(text);
-                self.input_box.buffer.move_to_end();
-                return vec![];
-            }
-            CommandAction::Passthrough => {}
         }
 
         let streaming = self.status == Status::Streaming;
         match self.input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
-            InputAction::PaletteSync(val) => {
-                self.command_palette.sync(&val);
+            InputAction::Changed => {
+                self.input_changed(InputWriter::Anyone);
                 vec![]
             }
             InputAction::Passthrough(key) => {
@@ -2182,8 +2532,147 @@ impl App {
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.hints.poll(self.hint_reader.load_full())
+            | self.tick_plan()
             | self.tick_file_picker()
+            | self.tick_input_changed()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    /// Both halves of the plan surface the Lua host answers asynchronously:
+    /// the menu a draft opens with, and the built-in outcome a picked plugin
+    /// row still owes. Drained for every session, since a plan that lands in
+    /// a background tab has to reach its form too.
+    pub(crate) fn tick_plan(&mut self) -> Dirty {
+        self.tick_plan_form() | self.tick_plan_action()
+    }
+
+    /// Open the form with the menu the `ui.plan_form*` chains answered with.
+    /// A chain that answers to keep it closed leaves it closed, and the
+    /// plan-toggle key still reopens it. A chain that says nothing at all
+    /// runs out of [`PLAN_FORM_ANSWER_WAIT`] and leaves the built-in form.
+    pub(crate) fn tick_plan_form(&mut self) -> Dirty {
+        let Some((deadline, rx)) = self.plan_answers.form.as_ref() else {
+            return Dirty::NO;
+        };
+        let (answered, expired) = (rx.try_recv(), Instant::now() >= *deadline);
+        let (menu, slow) = match answered {
+            // A layer took the surface over, so the host draws nothing. The
+            // menu goes with it, since its rows answer for the draft they
+            // were built for.
+            Ok(None) => {
+                self.plan_answers.abandon();
+                self.plan_form.forget_menu();
+                return Dirty::from(self.plan_form.is_visible());
+            }
+            Ok(Some(menu)) => (menu, false),
+            // The host went away mid-question, so nobody is drawing the plan.
+            Err(flume::TryRecvError::Disconnected) => (builtin_menu(), false),
+            Err(flume::TryRecvError::Empty) if expired => (builtin_menu(), true),
+            Err(flume::TryRecvError::Empty) => return Dirty::NO,
+        };
+        self.plan_answers.abandon();
+        self.plan_form.open_with(menu);
+        if slow {
+            self.flash(FLASH_PLAN_FORM_SLOW.into());
+        }
+        Dirty::YES
+    }
+
+    /// The built-in outcome a picked plugin row kept, once its handler has
+    /// answered.
+    ///
+    /// A handler that says `false` is gating the row on a check of its own
+    /// and stays quiet. A handler that failed, or a pick that reached no
+    /// handler, left the user watching the menu vanish for nothing, and says
+    /// so.
+    fn tick_plan_action(&mut self) -> Dirty {
+        let Some(pending) = self.plan_answers.action.as_ref() else {
+            return Dirty::NO;
+        };
+        // "Lost" is the host never having taken the pick, which reads
+        // differently to the user than a handler that ran and failed.
+        let (answered, expired) = (
+            pending.answer.try_recv(),
+            Instant::now() >= pending.deadline,
+        );
+        let (outcome, lost) = match answered {
+            Ok(outcome) => (outcome, false),
+            Err(flume::TryRecvError::Disconnected) => (PlanActionOutcome::Failed, true),
+            Err(flume::TryRecvError::Empty) if expired => (PlanActionOutcome::Failed, true),
+            Err(flume::TryRecvError::Empty) => return Dirty::NO,
+        };
+        let pending = self.plan_answers.action.take().expect("checked above");
+        if pending.pick != self.plan_answers.pick {
+            // Running the outcome of a pick the user has navigated away from
+            // would be a second implement prompt behind the one they asked
+            // for, or one against a session they never picked in.
+            tracing::debug!(outcome = ?outcome, "dropping the answer of a stale plan form pick");
+            return Dirty::NO;
+        }
+        match outcome {
+            PlanActionOutcome::Proceed => {
+                let actions = match pending.then {
+                    Some(PlanRowAction::Implement) => self.implement_plan(false),
+                    Some(PlanRowAction::ClearAndImplement) => self.implement_plan(true),
+                    Some(PlanRowAction::Refine) | None => vec![],
+                };
+                self.pending_actions.extend(actions);
+            }
+            PlanActionOutcome::Vetoed => {}
+            PlanActionOutcome::Failed => self.flash(
+                if lost {
+                    FLASH_PLAN_ACTION_LOST
+                } else {
+                    FLASH_PLAN_ACTION_FAILED
+                }
+                .into(),
+            ),
+        }
+        Dirty::YES
+    }
+
+    /// Ask the `ui.plan_form*` chains what to draw for the draft that just
+    /// landed, starting from the host's own rows.
+    ///
+    /// Only asked when a plugin is layering one of them. With no layer the
+    /// chain answers with the host's own rows by construction, and the
+    /// roundtrip through a request loop that may be busy would cost a stock
+    /// install its form.
+    pub(super) fn offer_plan_form(&mut self, path: Option<&str>) {
+        // A new draft retires the pick the last one was waiting on, handler
+        // and built-in outcome both. The handler may well still be running,
+        // but its answer is stamped with a pick nobody waits on any more, so
+        // the outcome the row promised is gone and the user is told.
+        let lost_pick = self.plan_answers.action.is_some();
+        self.plan_answers.abandon();
+        if lost_pick {
+            self.flash(FLASH_PLAN_ACTION_LOST.into());
+        }
+        let Some(path) = path.filter(|_| self.lua_event_handle.plan_form_layered()) else {
+            self.plan_form.open_with(builtin_menu());
+            return;
+        };
+        // The last draft's menu is not this draft's, and the chain has not
+        // answered with one yet.
+        self.plan_form.forget_menu();
+        let answer = self.lua_event_handle.open_plan_form(
+            path.to_owned(),
+            self.state.session.id.to_string(),
+            builtin_rows(),
+        );
+        self.plan_answers.form = Some((Instant::now() + PLAN_FORM_ANSWER_WAIT, answer));
+    }
+
+    /// What a tab nobody is looking at still owes the frame. Its floats have
+    /// to drain, or a plugin writing to a window off screen would lose the
+    /// output, and its plan form too, or a draft in a background tab would
+    /// sit unanswered until the user focused it. Nothing it holds was
+    /// announced this frame, because it never diffed its input, so the
+    /// announcement has to speak when this tab takes focus.
+    pub fn tick_background(&mut self) {
+        self.input_fired_this_frame = false;
+        let _ = self.float_mgr.tick();
+        let _ = self.tick_plan();
     }
 
     fn tick_file_picker(&mut self) -> Dirty {
@@ -2200,7 +2689,7 @@ impl App {
     pub fn cadence(&self) -> Cadence {
         Cadence::any([
             Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
-            StatusBar::cadence(
+            self.status_bar.cadence(
                 &self.status,
                 self.restoring.load(Ordering::Relaxed),
                 self.retry_info.is_some(),
@@ -2279,8 +2768,8 @@ impl App {
         if !self.is_main_chat() {
             return;
         }
-        if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
-            self.command_palette.sync(&val);
+        if let InputAction::Changed = self.input_box.handle_paste(text) {
+            self.input_changed(InputWriter::Anyone);
         }
     }
 
@@ -2288,6 +2777,7 @@ impl App {
         match action {
             PlanFormAction::Consumed | PlanFormAction::Passthrough => vec![],
             PlanFormAction::Hide => {
+                self.plan_answers.abandon();
                 self.plan_form.hide();
                 vec![]
             }
@@ -2298,9 +2788,46 @@ impl App {
                     vec![]
                 }
             },
-            PlanFormAction::Implement => self.implement_plan(false, self.plan_form.parallel()),
+            PlanFormAction::Implement => {
+                self.plan_answers.abandon();
+                self.implement_plan(false)
+            }
             PlanFormAction::ClearAndImplement => {
-                self.implement_plan(true, self.plan_form.parallel())
+                self.plan_answers.abandon();
+                self.implement_plan(true)
+            }
+            PlanFormAction::Plugin {
+                row,
+                generation,
+                then,
+            } => {
+                // Snapshot the parallel flag before reset() clears it, since
+                // the handler is told what it was.
+                let parallel = self.plan_form.parallel();
+                let path = self
+                    .state
+                    .plan
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                // Plan state is per session, so the handler is told which one
+                // fired instead of assuming the focused tab.
+                let session = self.state.session.id.to_string();
+                self.plan_form.reset();
+                // The generation travels with the pick, so a chain that
+                // resumed late and installed its handlers over this menu
+                // cannot answer for the rows the user saw.
+                let answer = self
+                    .lua_event_handle
+                    .run_plan_action(session, generation, row, path, parallel);
+                let pick = self.plan_answers.abandon();
+                self.plan_answers.action = Some(PlanAction {
+                    pick,
+                    then,
+                    deadline: Instant::now() + PLAN_ACTION_ANSWER_WAIT,
+                    answer,
+                });
+                vec![]
             }
         }
     }
@@ -2323,8 +2850,8 @@ impl App {
                 self.plan_form.hide();
                 Ok(vec![])
             }
-            "implement" => Ok(self.implement_plan(false, parallel)),
-            "clear_and_implement" => Ok(self.implement_plan(true, parallel)),
+            "implement" => Ok(self.implement_plan_with_parallel(false, parallel)),
+            "clear_and_implement" => Ok(self.implement_plan_with_parallel(true, parallel)),
             other => Err(format!("unknown plan action: {other}")),
         }
     }
@@ -2365,7 +2892,37 @@ impl App {
         Some(current)
     }
 
-    fn implement_plan(&mut self, clear_context: bool, parallel: bool) -> Vec<Action> {
+    /// Snapshot of the current plan for `maki.plan.read()`. `content` stays
+    /// `None` when the plan is not ready or the file cannot be read, which an
+    /// empty plan is not.
+    pub(crate) fn plan_snapshot(&self) -> serde_json::Value {
+        let mode = if self.state.mode == Mode::Plan {
+            "plan"
+        } else {
+            "build"
+        };
+        let path = self.state.plan.path().map(|p| p.display().to_string());
+        let ready = self.state.plan.is_ready();
+        let content = if ready {
+            self.state
+                .plan
+                .path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+        } else {
+            None
+        };
+        serde_json::json!({
+            "mode": mode,
+            "path": path,
+            "ready": ready,
+            "content": content,
+        })
+    }
+
+    /// Fork-only sibling of upstream's `implement_plan`: the remote picker's
+    /// `parallel` is the browser's own toggle rather than local widget state,
+    /// so the hint is built from the argument instead of `plan_form`.
+    fn implement_plan_with_parallel(&mut self, clear_context: bool, parallel: bool) -> Vec<Action> {
         self.plan_form.reset();
         let plan_snapshot = match std::mem::take(&mut self.state.plan) {
             PlanState::Ready(p) => Some((
@@ -2402,10 +2959,45 @@ impl App {
         actions.extend(self.start_from_queue(&msg));
         actions
     }
-}
 
-fn is_streaming_stop_key(key: KeyEvent) -> bool {
-    key::QUIT.matches(key) || key.code == KeyCode::Esc
+    fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
+        let parallel = self.plan_form.parallel();
+        self.plan_form.reset();
+        let plan_snapshot = match std::mem::take(&mut self.state.plan) {
+            PlanState::Ready(p) => Some((
+                std::fs::read_to_string(&p).unwrap_or_default(),
+                p.display().to_string(),
+            )),
+            _ => None,
+        };
+
+        self.state.mode = Mode::Build;
+
+        let mut actions = if clear_context {
+            self.reset_session()
+        } else {
+            vec![]
+        };
+
+        let text = if let Some((content, path_str)) = plan_snapshot {
+            let text = if parallel {
+                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`. {IMPLEMENT_PARALLEL_HINT}")
+            } else {
+                format!("{IMPLEMENT_MSG_PREFIX} at `{path_str}`.")
+            };
+            self.main_chat()
+                .push(DisplayMessage::plan(content, path_str));
+            text
+        } else {
+            format!("{}.", IMPLEMENT_MSG_PREFIX)
+        };
+        let msg = QueuedMessage {
+            text,
+            images: vec![],
+        };
+        actions.extend(self.start_from_queue(&msg));
+        actions
+    }
 }
 
 fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {

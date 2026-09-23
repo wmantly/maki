@@ -18,10 +18,11 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
 use crossterm::event::{
-    Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
+    Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
+use maki_agent::session::Resumed;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
@@ -32,27 +33,27 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
-    PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction, UiAttachment,
-    UiReply,
+    EventHandle, HintReader, InputRequest, Key, KeymapReader, LuaCommandReader, ModelRequest,
+    PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest, TaskRequest,
+    UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
-use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
-use maki_storage::sessions::{SessionError, normalize_title};
+use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
+use ratatui::layout::Rect;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::AppSession;
 use crate::agent::{
     AgentHandles, ModelSlot, ModelSlots,
     shared_queue::{Compaction, QueueItem, QueuedInput},
 };
+use crate::app::mode::Mode;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
@@ -62,6 +63,7 @@ use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, Status};
 use crate::input::InputReader;
 use crate::repaint::{Dirty, IDLE_POLL};
+use crate::{AppSession, OpenSession};
 
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
@@ -73,6 +75,7 @@ const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const NOT_LIVE_ERR: &str = "session not live";
 const PACK_PREPARING: &str = "Checking packages...";
 const PACK_BUSY_ERR: &str = "a package command is already running";
+const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
 const REMOTE_NO_DOMAIN_MSG: &str =
     "remote control needs a domain: set remote_control.domain in the config, or run /rc <domain>";
@@ -84,15 +87,19 @@ const REMOTE_STOPPED_MSG: &str = "remote control stopped";
 /// disk round-trip; `session_has_content` tells which ones were saved.
 pub(crate) struct ShutdownReport {
     pub exit: ExitRequest,
-    pub tabs: Vec<AppSession>,
+    pub tabs: Vec<OpenSession>,
     pub focused: usize,
+    /// Sessions whose transcript never reached disk. The caller prints them
+    /// after dropping the terminal guard, so the line is not lost with the
+    /// alternate screen.
+    pub unsaved: Vec<MakiId>,
 }
 
 pub struct EventLoopParams {
     pub model: Model,
     pub needs_login: bool,
     pub commands: Vec<CustomCommand>,
-    pub sessions: Vec<AppSession>,
+    pub sessions: Vec<OpenSession>,
     pub focused: usize,
     pub startup_warnings: Vec<String>,
     pub startup_notice: Option<String>,
@@ -109,6 +116,7 @@ pub struct EventLoopParams {
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
+    pub ui_wake_rx: flume::Receiver<()>,
     pub ui_attachment: UiAttachment,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
@@ -332,6 +340,14 @@ fn parse_session_id(id: &str) -> Result<MakiId, String> {
     id.parse().map_err(|e: MakiIdParseError| e.to_string())
 }
 
+fn parse_mode(mode: &str) -> Result<Mode, String> {
+    match mode {
+        MODE_BUILD => Ok(Mode::Build),
+        MODE_PLAN => Ok(Mode::Plan),
+        other => Err(format!("{UNKNOWN_MODE_ERR}, got {other:?}")),
+    }
+}
+
 struct SessionRuntime {
     app: App,
     handles: AgentHandles,
@@ -404,18 +420,24 @@ struct SpawnCtx {
 }
 
 impl SpawnCtx {
-    fn spawn_runtime(&self, session: AppSession, slot: Arc<ModelSlot>) -> SessionRuntime {
+    fn spawn_runtime(&self, open: OpenSession, slot: Arc<ModelSlot>) -> SessionRuntime {
+        let session = &open.session;
         let resumed = !session.messages().is_empty();
         let permissions = Arc::new(self.permissions.fork());
         let cell = Arc::new(ArcSwap::from(Arc::clone(&slot)));
         let handles = AgentHandles::spawn(
             &cell,
-            session.messages().to_vec(),
-            session.meta.context_size,
+            Resumed {
+                id: SessionRef::from(session.id),
+                history: session.messages().to_vec(),
+                context_size: session.meta.context_size,
+                // The tab owns the session and persists it through
+                // `StorageWriter`, so the agent gets the transcript only.
+                session: None,
+            },
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
-            Some(SessionRef::from(session.id)),
             self.timeouts,
             self.lua_event_handle.clone(),
             self.mcp_handle.clone(),
@@ -424,7 +446,7 @@ impl SpawnCtx {
         );
         let mut app = App::new(
             &slot.model,
-            session,
+            open,
             self.storage.clone(),
             Arc::clone(&self.available_models),
             handles.mcp_reader(),
@@ -476,6 +498,7 @@ pub(crate) struct EventLoop<'t> {
     models_rx: flume::Receiver<()>,
     models_tx: flume::Sender<()>,
     ui_action_rx: flume::Receiver<UiAction>,
+    ui_wake_rx: flume::Receiver<()>,
     ui_attachment: UiAttachment,
     pack_tx: flume::Sender<Box<PackPreparation>>,
     pack_rx: flume::Receiver<Box<PackPreparation>>,
@@ -493,6 +516,9 @@ enum Wake {
     Input(Event),
     InputGone,
     Ui(UiAction),
+    /// Nothing to handle. The tick after every wake is what reads plugin
+    /// windows.
+    PluginWindow,
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
     Warn(String),
@@ -598,6 +624,7 @@ impl<'t> EventLoop<'t> {
             keymap_reader,
             hint_reader,
             ui_action_rx,
+            ui_wake_rx,
             ui_attachment,
             lua_event_handle,
             model_policy,
@@ -670,9 +697,9 @@ impl<'t> EventLoop<'t> {
 
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
-            .map(|session| {
-                let (slot, reason) = slots.get_or_fallback(&session.model);
-                let mut rt = ctx.spawn_runtime(session, slot);
+            .map(|open| {
+                let (slot, reason) = slots.get_or_fallback(&open.session.model);
+                let mut rt = ctx.spawn_runtime(open, slot);
                 if let Some(reason) = reason {
                     rt.app.flash(reason);
                 }
@@ -690,13 +717,13 @@ impl<'t> EventLoop<'t> {
         }
         if !ctx.mcp_config_errors.is_empty() {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
-            app.flash(msg);
+            app.queue_flash(msg);
         }
         if let Some(notice) = startup_notice {
-            app.flash(notice);
+            app.queue_flash(notice);
         }
         for warning in startup_warnings {
-            app.flash(warning);
+            app.queue_flash(warning);
         }
 
         let (pack_tx, pack_rx) = flume::unbounded();
@@ -715,6 +742,7 @@ impl<'t> EventLoop<'t> {
             models_rx: bg.models_rx,
             models_tx: bg.models_tx,
             ui_action_rx,
+            ui_wake_rx,
             ui_attachment,
             pack_tx,
             pack_rx,
@@ -828,6 +856,11 @@ impl<'t> EventLoop<'t> {
         if !self.ui_action_rx.is_disconnected() {
             sel = sel.recv(&self.ui_action_rx, |res| res.ok().map(Wake::Ui));
         }
+        if !self.ui_wake_rx.is_disconnected() {
+            sel = sel.recv(&self.ui_wake_rx, |res| {
+                res.ok().map(|()| Wake::PluginWindow)
+            });
+        }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
         sel = sel.recv(&self.pack_rx, |res| res.ok().map(Wake::Pack));
         sel = sel.recv(&self.models_rx, |res| {
@@ -851,6 +884,7 @@ impl<'t> EventLoop<'t> {
             Wake::Input(ev) => self.handle_input(ev),
             Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
             Wake::Ui(action) => self.handle_ui_action(action),
+            Wake::PluginWindow => {}
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
@@ -870,9 +904,8 @@ impl<'t> EventLoop<'t> {
     }
 
     /// Only the focused session is drawn, so only it can owe a frame; focusing
-    /// another is an event, and events always repaint. Background sessions
-    /// still drain their floats, or a plugin writing to a window nobody is
-    /// looking at would lose the output.
+    /// another is an event, and events always repaint. The rest get
+    /// [`App::tick_background`].
     fn tick(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         let state = self.remote.state();
@@ -880,7 +913,7 @@ impl<'t> EventLoop<'t> {
             if i == self.focused {
                 dirty |= rt.app.tick();
             } else {
-                let _ = rt.app.float_mgr.tick();
+                rt.app.tick_background();
             }
             let (updated, closed) = rt.app.take_window_changes();
             if let Some(state) = &state
@@ -910,6 +943,13 @@ impl<'t> EventLoop<'t> {
                     None => state.send_plan_cleared(&session_id),
                 }
             }
+        }
+        // A plan form row outlives the key press that picked it: its handler
+        // runs on the Lua thread, and the built-in outcome the row kept
+        // follows only once that answers.
+        for i in 0..self.sessions.len() {
+            let actions = std::mem::take(&mut self.sessions[i].app.pending_actions);
+            self.dispatch(i, actions);
         }
         dirty
     }
@@ -1116,8 +1156,14 @@ impl<'t> EventLoop<'t> {
             UiAction::Model { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_model_request(req));
             }
+            UiAction::Input { req, reply_tx } => {
+                let _ = reply_tx.send(self.handle_input_request(req));
+            }
             UiAction::Task { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_task_request(req));
+            }
+            UiAction::Plan { req, reply_tx } => {
+                let _ = reply_tx.send(self.handle_plan_request(req));
             }
             UiAction::WinSaveView { reply_tx } => {
                 let _ = reply_tx.send(self.focused_app().win_view());
@@ -1241,6 +1287,11 @@ impl<'t> EventLoop<'t> {
     /// and `maki.task.focus`, so none of them has to remember to fire an
     /// event. A session switch is a task switch too, so `TaskFocusChanged`
     /// always follows `SessionFocusChanged`.
+    ///
+    /// A switch also republishes the input the newly focused tab holds. Only
+    /// the focused session ticks, so a background tab never diffs its own
+    /// input, and without the announcement a handler keeps acting on the text
+    /// of the tab it came from.
     fn emit_focus_changes(&mut self) {
         let rt = &self.sessions[self.focused];
         let current = (rt.id(), rt.app.active_task_id());
@@ -1249,6 +1300,7 @@ impl<'t> EventLoop<'t> {
         }
         let previous_session = self.last_focus.replace(current.clone()).map(|(id, _)| id);
         let (session_id, task_id) = current;
+        let switched = previous_session.is_some() && previous_session != Some(session_id);
         let eh = &self.ctx.lua_event_handle;
         if previous_session != Some(session_id) {
             let mut data = json!({ "session_id": session_id });
@@ -1261,6 +1313,9 @@ impl<'t> EventLoop<'t> {
             "TaskFocusChanged",
             json!({ "session_id": session_id, "id": task_id }),
         );
+        if switched {
+            self.focused_app().announce_input();
+        }
     }
 
     fn start_mailbox_runs(&mut self) -> Dirty {
@@ -1312,6 +1367,7 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                 };
+                let mut claim = None;
                 if let Some(i) = self.position(id) {
                     if i == self.focused {
                         let _ = reply_tx.send(Err(DELETE_FOCUSED_ERR.into()));
@@ -1322,12 +1378,12 @@ impl<'t> EventLoop<'t> {
                         .lua_event_handle
                         .end_session(rt.id(), SessionEndReason::Delete);
                     rt.handles.cancel_all();
+                    claim = Some(rt.app.state.claim.clone());
                 }
-                self.ctx.storage_writer.delete(id, move |res| {
+                self.ctx.storage_writer.delete(id, claim, move |res| {
                     let reply = match res {
-                        Ok(()) | Err(SessionError::Storage(StorageError::NotFound(_))) => {
-                            Ok(json!(true))
-                        }
+                        Ok(()) => Ok(json!(true)),
+                        Err(e) if e.is_not_found() => Ok(json!(true)),
                         Err(e) => Err(e.to_string()),
                     };
                     let _ = reply_tx.send(reply);
@@ -1361,11 +1417,11 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(reply);
             }
             SessionRequest::New { prompt, focus } => {
-                let session = self.focused_app().blank_session();
+                let open = self.focused_app().blank_session();
                 // A blank session inherits the focused tab's model, whose slot
                 // is already built and sitting right here.
                 let slot = self.sessions[self.focused].slot.load_full();
-                let idx = self.push_runtime(self.ctx.spawn_runtime(session, slot));
+                let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
                 let id = self.sessions[idx].id();
                 maki_otel::emit::session_started(
                     maki_otel::emit::START_FRESH,
@@ -1395,6 +1451,17 @@ impl<'t> EventLoop<'t> {
                     .map(|()| json!(true));
                 let _ = reply_tx.send(reply);
             }
+            // Resolved by id like the rest: a plan form row asking for build
+            // mode fires for the session whose plan landed, which may be in
+            // the background.
+            SessionRequest::SetMode { id, mode } => {
+                let reply = parse_mode(&mode).and_then(|mode| {
+                    let idx = self.resolve_session_index(id.as_deref())?;
+                    self.sessions[idx].app.set_mode(mode);
+                    Ok(json!(true))
+                });
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::SetTitle { id, title } => {
                 let title = normalize_title(&title);
                 let reply = (|| {
@@ -1402,14 +1469,29 @@ impl<'t> EventLoop<'t> {
                     if let Some(i) = self.position(id) {
                         self.sessions[i].app.state.session_mut().set_title(title);
                     } else {
-                        let mut session =
-                            AppSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
+                        let OpenSession { mut session, claim } =
+                            OpenSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
                         session.set_title(title);
-                        self.ctx.storage_writer.send(Arc::new(session));
+                        self.ctx.storage_writer.send(Arc::new(session), claim);
                     }
                     Ok(json!(true))
                 })();
                 let _ = reply_tx.send(reply);
+            }
+        }
+    }
+
+    /// The input a plugin reads and writes is the focused session's.
+    ///
+    /// An edit is answered against the terminal as it is now, not as the last
+    /// frame found it: a batch of wakes runs between two paints, so the size
+    /// the box would be drawn at has to be asked for here.
+    fn handle_input_request(&mut self, req: InputRequest) -> UiReply {
+        match req {
+            InputRequest::Read => Ok(self.focused_app().input_snapshot()),
+            InputRequest::Edit(edit) => {
+                let area = self.terminal.size().map(Rect::from).unwrap_or_default();
+                self.focused_app().apply_input_edit(edit, area)
             }
         }
     }
@@ -1442,6 +1524,16 @@ impl<'t> EventLoop<'t> {
                 }
                 Ok(app.model_state())
             }
+        }
+    }
+
+    /// Route a plan-surface request to the session it names, or the focused
+    /// one when it names none. Plan state is per session, so a plugin woken
+    /// by a background tab's `PlanReady` would otherwise read the wrong plan.
+    fn handle_plan_request(&mut self, req: PlanRequest) -> UiReply {
+        let idx = self.resolve_session_index(req.session())?;
+        match req {
+            PlanRequest::Read { .. } => Ok(self.sessions[idx].app.plan_snapshot()),
         }
     }
 
@@ -1491,7 +1583,7 @@ impl<'t> EventLoop<'t> {
             cwd: app.state.session.cwd.clone(),
             title: Some(app.state.session.title.clone()),
             model: app.state.model.spec(),
-            mode: if app.state.mode == crate::app::mode::Mode::Plan {
+            mode: if app.state.mode == Mode::Plan {
                 MODE_PLAN
             } else {
                 MODE_BUILD
@@ -1535,19 +1627,21 @@ impl<'t> EventLoop<'t> {
             self.focused = i;
             return Ok(());
         }
-        let session = AppSession::load(id, &self.ctx.storage)
+        // A session another maki owns is refused here, where it costs a flash,
+        // rather than at the first write, after a whole conversation.
+        let open = OpenSession::load(id, &self.ctx.storage)
             .map_err(|e| format!("Failed to load session: {e}"))?;
-        let (slot, reason) = self.slots.get_or_fallback(&session.model);
+        let (slot, reason) = self.slots.get_or_fallback(&open.session.model);
         let focused = &self.sessions[self.focused];
         if SessionStatus::of(&focused.app) == SessionStatus::Idle && !focused.app.has_content() {
             let idx = self.focused;
             let history = self.sessions[idx]
                 .app
-                .apply_loaded_session(session, &slot.model);
+                .apply_loaded_session(open, &slot.model);
             self.apply_model(idx, slot);
             self.respawn_agent(idx, history);
         } else {
-            self.focused = self.push_runtime(self.ctx.spawn_runtime(session, slot));
+            self.focused = self.push_runtime(self.ctx.spawn_runtime(open, slot));
         }
         if let Some(reason) = reason {
             self.focused_app().flash(reason);
@@ -1579,9 +1673,16 @@ impl<'t> EventLoop<'t> {
                 self.focus.report(Focus::Unfocused);
                 (None, None)
             }
+            // The one place the host's view of a keypress is normalized, so
+            // it can never disagree with the identity a plugin is handed. A
+            // key no notation names passes through untouched: nothing to
+            // normalize, and `text_buffer` still reads its SUPER bit.
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 self.focus.note_input();
-                (Some(Msg::Key(key)), None)
+                (
+                    Some(Msg::Key(Key::from_event(key).map_or(key, KeyEvent::from))),
+                    None,
+                )
             }
             Event::Key(_) => (None, None),
             Event::Paste(text) => {
@@ -2225,7 +2326,10 @@ impl<'t> EventLoop<'t> {
             app.checkpoint_now();
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
-            tabs.push(Arc::unwrap_or_clone(app.state.session));
+            tabs.push(OpenSession {
+                session: Arc::unwrap_or_clone(app.state.session),
+                claim: app.state.claim,
+            });
             agent_tasks.push(handles.into_task());
         }
         let save_sessions_ms = lap();
@@ -2235,12 +2339,13 @@ impl<'t> EventLoop<'t> {
             smol::block_on(h.shutdown());
         }
         let mcp_shutdown_ms = lap();
-        match Arc::try_unwrap(self.ctx.storage_writer) {
+        let unsaved = match Arc::try_unwrap(self.ctx.storage_writer) {
             Ok(writer) => writer.shutdown(AGENT_SHUTDOWN_TIMEOUT),
             Err(_) => {
-                warn!("storage writer has outstanding references, skipping graceful shutdown")
+                warn!("storage writer has outstanding references, skipping graceful shutdown");
+                Vec::new()
             }
-        }
+        };
         let storage_drain_ms = lap();
         info!(
             session_end_ms,
@@ -2256,6 +2361,7 @@ impl<'t> EventLoop<'t> {
             exit,
             tabs,
             focused: self.focused,
+            unsaved,
         }
     }
 }

@@ -309,16 +309,7 @@ impl Copilot {
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
-        let mut body = json!({
-            "model": model.id,
-            "max_tokens": model.output_tokens().unwrap_or(shared::FALLBACK_MAX_TOKENS),
-            "system": [{"type": "text", "text": system}],
-            "messages": anthropic_messages(messages),
-            "tools": tools,
-            "stream": true,
-        });
-        thinking.apply_to_body(&mut body, model);
-
+        let body = messages_body(model, messages, system, tools, thinking);
         let request = self
             .build_post(&auth, MESSAGES_PATH, Some("conversation-agent"), &body)?
             .header("anthropic-version", "2023-06-01")
@@ -696,18 +687,23 @@ fn copilot_auth_from_resolved(auth: &super::ResolvedAuth) -> Result<CopilotAuth,
     })
 }
 
-fn anthropic_messages(messages: &[Message]) -> Value {
-    Value::Array(
-        messages
-            .iter()
-            .map(|message| {
-                json!({
-                    "role": message.role,
-                    "content": message.content,
-                })
-            })
-            .collect(),
-    )
+fn messages_body(
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    thinking: ThinkingConfig,
+) -> Value {
+    let mut body = json!({
+        "model": model.id,
+        "max_tokens": model.output_tokens().unwrap_or(shared::FALLBACK_MAX_TOKENS),
+        "system": [{"type": "text", "text": system}],
+        "messages": shared::wire_messages(messages),
+        "tools": tools,
+        "stream": true,
+    });
+    thinking.apply_to_body(&mut body, model);
+    body
 }
 
 fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
@@ -790,12 +786,14 @@ impl Provider for Copilot {
 
 #[cfg(test)]
 mod tests {
-    const OPUS_CACHE_WRITE: f64 = 6.25;
-
     use super::*;
-    use crate::TokenUsage;
     use crate::spec::ProviderRegistry;
+    use crate::{ContentBlock, Role, TokenUsage};
     use test_case::test_case;
+
+    const OPUS_CACHE_WRITE: f64 = 6.25;
+    const CLAUDE_SPEC: &str = "copilot/claude-opus-5";
+    const REPLY: &str = "reply";
 
     #[test]
     fn endpoint_prefers_messages_then_responses_then_chat() {
@@ -1011,6 +1009,29 @@ mod tests {
             json!({"reasoning": {"effort": "medium", "summary": "auto"}})
         );
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn messages_body_drops_unsigned_thinking_without_cache_control() {
+        let model = Model::from_spec(CLAUDE_SPEC).unwrap();
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "gpt reasoning summary".into(),
+                    signature: None,
+                },
+                ContentBlock::Text { text: REPLY.into() },
+            ],
+            ..Default::default()
+        }];
+
+        let body = messages_body(&model, &messages, "system", &json!([]), ThinkingConfig::Off);
+
+        assert_eq!(
+            body["messages"],
+            json!([{"role": "assistant", "content": [{"type": "text", "text": REPLY}]}])
+        );
     }
 
     #[test]
