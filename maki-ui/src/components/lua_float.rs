@@ -406,8 +406,15 @@ impl FloatManager {
     }
 
     /// Forwards a pre-stringified key (matching [`key_event_to_string`]'s
-    /// format) to the focused window, exactly as [`Self::handle_key`] does
-    /// for a real local keypress — the shared path a remote key event uses.
+    /// format, e.g. `"enter"`, `"ctrl+c"`, `"a"`) to the focused window,
+    /// exactly as [`Self::handle_focused_key`] does for a real local keypress
+    /// — the shared path a remote key event uses.
+    ///
+    /// That format is the browser's spelling, not vim notation, so it is
+    /// bracketed into [`Key::parse`]'s input (`"enter"` → `<enter>`,
+    /// `"ctrl+c"` → `<ctrl+c>`), where the name and modifier aliases resolve
+    /// it. A key no notation can name (e.g. `Super+Enter`) still spends the
+    /// press with nothing sent, matching the local path.
     pub(crate) fn forward_key_str(&self, key: &str) -> bool {
         if key.is_empty() {
             return false;
@@ -418,7 +425,8 @@ impl FloatManager {
         let Some(win) = self.windows.iter().find(|w| w.id == fid) else {
             return false;
         };
-        let Ok(key) = Key::parse(key) else {
+        let notation = format!("<{key}>");
+        let Ok(key) = Key::parse(&notation) else {
             return false;
         };
         let _ = win.event_tx.try_send(WinEvent::Key { key });
@@ -3394,10 +3402,39 @@ mod tests {
         let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["a"]);
 
         assert!(mgr.forward_key_str("enter"));
+        // "enter" is the browser's spelling; the Key it resolves to prints its
+        // own canonical notation, which is `name_of`'s `<CR>` for Enter.
         let found = event_rx
             .drain()
-            .any(|e| matches!(e, WinEvent::Key { key } if key.notation() == "enter"));
+            .any(|e| matches!(e, WinEvent::Key { key } if key == Key::parse("<CR>").unwrap()));
         assert!(found, "expected a Key event with the given key");
+    }
+
+    #[test]
+    fn forward_key_str_resolves_every_browser_spelling() {
+        // The browser's `winKeyString` spells keys as `ctrl+c`, `space`, `esc`,
+        // ... — not vim notation — so each must resolve to the Key a local
+        // press would carry, or the remote window silently drops it.
+        for (browser, notation) in [
+            ("enter", "<CR>"),
+            ("esc", "<Esc>"),
+            ("space", "<Space>"),
+            ("up", "<Up>"),
+            ("pageup", "<PageUp>"),
+            ("f5", "<F5>"),
+            ("a", "a"),
+            ("ctrl+c", "<C-c>"),
+            ("alt+enter", "<M-CR>"),
+        ] {
+            let mut mgr = FloatManager::new();
+            let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+            assert!(mgr.forward_key_str(browser), "{browser} must resolve");
+            let expected = Key::parse(notation).unwrap();
+            let found = event_rx
+                .drain()
+                .any(|e| matches!(e, WinEvent::Key { key } if key == expected));
+            assert!(found, "{browser} must reach the window as {notation}");
+        }
     }
 
     #[test]
