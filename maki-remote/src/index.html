@@ -1936,38 +1936,43 @@
   // keybinding, permission card, ...); reusing it here means "close" needs
   // no separate server-side concept — the plugin's own esc handling, which
   // already runs locally, decides what closing means.
-  winCloseBtn.onclick = () => submitWindowKey("esc");
+  winCloseBtn.onclick = () => submitWindowKey("<Esc>");
   winBackdrop.addEventListener("click", (ev) => {
-    if (ev.target === winBackdrop) submitWindowKey("esc");
+    if (ev.target === winBackdrop) submitWindowKey("<Esc>");
   });
 
-  // Mirrors maki-ui's key_event_to_string exactly (components/keybindings.rs)
-  // so a browser keypress reaches the same WinEvent::Key a local one would.
+  // Keys cross the wire as maki's vim notation — the spelling `Key::parse`
+  // reads and `Key::notation` prints — so a browser keypress reaches the same
+  // `WinEvent::Key` a local one would (see maki-lua's `key` module). The
+  // modifier prefixes are the canonical `C-`/`M-`/`S-`, not `ctrl+`/`alt+`.
   const winKeyString = (ev) => {
     let prefix = "";
-    if (ev.ctrlKey) prefix += "ctrl+";
-    if (ev.altKey) prefix += "alt+";
+    if (ev.ctrlKey) prefix += "C-";
+    if (ev.altKey) prefix += "M-";
     const isChar = ev.key.length === 1 && ev.key !== " ";
-    if (ev.shiftKey && !isChar) prefix += "shift+";
+    if (ev.shiftKey && !isChar) prefix += "S-";
     switch (ev.key) {
-      case " ": return prefix + "space";
-      case "Enter": return prefix + "enter";
-      case "Escape": return prefix + "esc";
-      case "Tab": return prefix + "tab";
-      case "Backspace": return prefix + "backspace";
-      case "Delete": return prefix + "delete";
-      case "ArrowUp": return prefix + "up";
-      case "ArrowDown": return prefix + "down";
-      case "ArrowLeft": return prefix + "left";
-      case "ArrowRight": return prefix + "right";
-      case "Home": return prefix + "home";
-      case "End": return prefix + "end";
-      case "PageUp": return prefix + "pageup";
-      case "PageDown": return prefix + "pagedown";
-      case "Insert": return prefix + "insert";
+      case " ": return `<${prefix}Space>`;
+      case "Enter": return `<${prefix}CR>`;
+      case "Escape": return `<${prefix}Esc>`;
+      case "Tab": return `<${prefix}Tab>`;
+      case "Backspace": return `<${prefix}BS>`;
+      case "Delete": return `<${prefix}Del>`;
+      case "ArrowUp": return `<${prefix}Up>`;
+      case "ArrowDown": return `<${prefix}Down>`;
+      case "ArrowLeft": return `<${prefix}Left>`;
+      case "ArrowRight": return `<${prefix}Right>`;
+      case "Home": return `<${prefix}Home>`;
+      case "End": return `<${prefix}End>`;
+      case "PageUp": return `<${prefix}PageUp>`;
+      case "PageDown": return `<${prefix}PageDown>`;
+      case "Insert": return `<${prefix}Insert>`;
       default:
-        if (/^F([1-9]|1[0-9]|2[0-4])$/.test(ev.key)) return prefix + ev.key.toLowerCase();
-        return isChar ? prefix + ev.key : "";
+        if (/^F([1-9]|1[0-9]|2[0-4])$/.test(ev.key)) return `<${prefix}${ev.key.toUpperCase()}>`;
+        // A bare printable carries no brackets, exactly as `Key::notation`
+        // prints it (`Key::parse("a")` reads back to the same key).
+        if (!isChar) return "";
+        return prefix ? `<${prefix}${ev.key}>` : ev.key;
     }
   };
 

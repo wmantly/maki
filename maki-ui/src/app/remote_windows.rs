@@ -73,11 +73,12 @@ impl App {
     }
 
     /// Forwards a browser key or paste event to the focused window, exactly
-    /// as a local keypress/paste would — `key` must already be in
-    /// [`crate::components::keybindings::key_event_to_string`]'s format
-    /// (e.g. `"enter"`, `"ctrl+c"`, `"a"`). Errors when there is no focused
-    /// window to receive it, so the caller can tell the browser its input
-    /// landed nowhere instead of silently dropping it.
+    /// as a local keypress/paste would — `key` must already be in maki's vim
+    /// notation, the form [`Key::parse`] reads and [`Key::notation`] prints
+    /// (e.g. `"<CR>"`, `"<C-c>"`, `"a"`). The web UI's `winKeyString` emits
+    /// exactly that. Errors when there is no focused window to receive it, so
+    /// the caller can tell the browser its input landed nowhere instead of
+    /// silently dropping it.
     pub(crate) fn send_remote_window_input(
         &self,
         key: Option<&str>,

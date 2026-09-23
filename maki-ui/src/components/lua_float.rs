@@ -405,16 +405,16 @@ impl FloatManager {
         self.focused_id
     }
 
-    /// Forwards a pre-stringified key (matching [`key_event_to_string`]'s
-    /// format, e.g. `"enter"`, `"ctrl+c"`, `"a"`) to the focused window,
-    /// exactly as [`Self::handle_focused_key`] does for a real local keypress
-    /// — the shared path a remote key event uses.
+    /// Forwards a key already spelled as maki's vim notation — the form
+    /// [`Key::parse`] reads and [`Key::notation`] prints, e.g. `<CR>`, `<Esc>`,
+    /// `<C-n>`, `a` — to the focused window, exactly as
+    /// [`Self::handle_focused_key`] does for a real local keypress. This is the
+    /// shared path a remote key event uses; the browser's `winKeyString` emits
+    /// this notation.
     ///
-    /// That format is the browser's spelling, not vim notation, so it is
-    /// bracketed into [`Key::parse`]'s input (`"enter"` → `<enter>`,
-    /// `"ctrl+c"` → `<ctrl+c>`), where the name and modifier aliases resolve
-    /// it. A key no notation can name (e.g. `Super+Enter`) still spends the
-    /// press with nothing sent, matching the local path.
+    /// A spelling no notation names (e.g. `<Super-CR>`) spends the press with
+    /// nothing sent, matching the local path, instead of falling through to a
+    /// built-in binding on the chat behind the window.
     pub(crate) fn forward_key_str(&self, key: &str) -> bool {
         if key.is_empty() {
             return false;
@@ -425,8 +425,7 @@ impl FloatManager {
         let Some(win) = self.windows.iter().find(|w| w.id == fid) else {
             return false;
         };
-        let notation = format!("<{key}>");
-        let Ok(key) = Key::parse(&notation) else {
+        let Ok(key) = Key::parse(key) else {
             return false;
         };
         let _ = win.event_tx.try_send(WinEvent::Key { key });
@@ -3401,46 +3400,37 @@ mod tests {
         let mut mgr = FloatManager::new();
         let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["a"]);
 
-        assert!(mgr.forward_key_str("enter"));
-        // "enter" is the browser's spelling; the Key it resolves to prints its
-        // own canonical notation, which is `name_of`'s `<CR>` for Enter.
+        assert!(mgr.forward_key_str("<CR>"));
         let found = event_rx
             .drain()
-            .any(|e| matches!(e, WinEvent::Key { key } if key == Key::parse("<CR>").unwrap()));
+            .any(|e| matches!(e, WinEvent::Key { key } if key.notation() == "<CR>"));
         assert!(found, "expected a Key event with the given key");
     }
 
     #[test]
     fn forward_key_str_resolves_every_browser_spelling() {
-        // The browser's `winKeyString` spells keys as `ctrl+c`, `space`, `esc`,
-        // ... — not vim notation — so each must resolve to the Key a local
-        // press would carry, or the remote window silently drops it.
-        for (browser, notation) in [
-            ("enter", "<CR>"),
-            ("esc", "<Esc>"),
-            ("space", "<Space>"),
-            ("up", "<Up>"),
-            ("pageup", "<PageUp>"),
-            ("f5", "<F5>"),
-            ("a", "a"),
-            ("ctrl+c", "<C-c>"),
-            ("alt+enter", "<M-CR>"),
+        // The browser's `winKeyString` emits vim notation (`<CR>`, `<C-n>`,
+        // ...), the one spelling `Key::parse` reads — so each must round-trip
+        // to the very Key a local press would carry.
+        for notation in [
+            "<CR>", "<Esc>", "<Space>", "<Up>", "<PageUp>", "<F5>", "a", "<C-c>", "<M-CR>",
+            "<C-S-a>",
         ] {
             let mut mgr = FloatManager::new();
             let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["a"]);
-            assert!(mgr.forward_key_str(browser), "{browser} must resolve");
+            assert!(mgr.forward_key_str(notation), "{notation} must resolve");
             let expected = Key::parse(notation).unwrap();
             let found = event_rx
                 .drain()
                 .any(|e| matches!(e, WinEvent::Key { key } if key == expected));
-            assert!(found, "{browser} must reach the window as {notation}");
+            assert!(found, "{notation} must reach the window unchanged");
         }
     }
 
     #[test]
     fn forward_key_str_returns_false_with_no_focused_window() {
         let mgr = FloatManager::new();
-        assert!(!mgr.forward_key_str("enter"));
+        assert!(!mgr.forward_key_str("<CR>"));
     }
 
     #[test]
