@@ -7574,6 +7574,7 @@ fn remote_permission_answer_rejects_unknown_answer() {
         vec![],
         None,
         true,
+        None,
     );
     let err = app
         .answer_remote_permission(RC_REQUEST_ID, "nonsense")
@@ -7591,6 +7592,7 @@ fn remote_permission_answer_routes_and_closes() {
         vec![],
         None,
         true,
+        None,
     );
     app.submit_remote_prompt("hi".into(), vec![]).unwrap();
     app.answer_remote_permission(RC_REQUEST_ID, "allow")

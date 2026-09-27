@@ -959,7 +959,7 @@ impl<'t> EventLoop<'t> {
         let current = is_current_top_level(rt.app.run_id, &envelope);
         if let Some(state) = self.remote.state() {
             state.send_envelope(&rt.id().to_string(), &envelope);
-            if let maki_agent::AgentEvent::PermissionRequest { id, tool, scopes } = &envelope.event
+            if let maki_agent::AgentEvent::PermissionRequest { id, tool, scopes, .. } = &envelope.event
             {
                 rt.last_permission_id = Some(id.clone());
                 state.send_permission(
