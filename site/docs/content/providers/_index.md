@@ -86,10 +86,12 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
 | Weak | **gpt-5.6-luna** (default) | $1.00 / $6.00 | 372K ctx / 128K out |
+| Weak | gpt-6-luna | $0.10 / $0.50 | 1050K ctx / 128K out |
 | Weak | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
 | Weak | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
 | Weak | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
 | Medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
+| Medium | gpt-6-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | Medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 | Medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
 | Medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
@@ -411,7 +413,7 @@ supports_vision = false
 | `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
 | `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
 | `headers` | table | Extra HTTP headers sent on every request to this provider. Values expand `${VAR}` from the environment; an unset or empty variable fails the provider instead of sending a half-filled header. A same-name header (case-insensitive) replaces the built-in auth header and survives key rotation |
-| `default_model` | string | Used after login when no model is saved yet |
+| `default_model` | string | Used after login when no model is saved yet. On a custom entry it is also the startup fallback when no built-in provider or `providers/` script is available. Without it, startup picks a declared `strong` or `medium` model |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `subsidised_by` | string | Name of the flat subscription prepaying this provider (e.g. `"Max"`). Models bill $0 and show the published list price beside it as a reference. The list-price fallback needs `protocol = "anthropic"` |

@@ -498,6 +498,20 @@ fn with_provider_if_available<T>(slug: &str, f: impl FnOnce(&ProviderData) -> T)
     guard.providers.get(slug).map(f)
 }
 
+/// The env var each catalog provider reads its key from, if one is set. A cold
+/// catalog gives nothing, because a fetch here would stall every spawn.
+pub(crate) fn key_vars_if_available() -> Vec<String> {
+    let Some(Ok(guard)) = SHARED_CATALOG.get().map(|catalog| catalog.lock()) else {
+        return Vec::new();
+    };
+    guard
+        .providers
+        .values()
+        .filter_map(ProviderData::env_key_set)
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Non-blocking availability check for catalog-backed providers: true only when
 /// the catalog is already warm, contains the slug, and auth resolves (API key or
 /// free access). Never triggers a fetch, unlike [`try_create`].
@@ -1064,6 +1078,9 @@ mod tests {
     const PAID_INPUT_PRICE: f64 = 1.0;
     const PAID_CONTEXT: u32 = 128_000;
     const PAID_OUTPUT: u32 = 64_000;
+    /// Stands in for `OPENCODE_API_KEY`, which a dev running the tests may
+    /// well have set, and then the free fallback would never kick in.
+    const UNSET_KEY_ENV: &str = "MAKI_TEST_UNSET_KEY";
 
     #[test]
     fn new_rejects_no_auth() {
@@ -1398,10 +1415,7 @@ mod tests {
         let (_tmp, state_dir) = temp_state_dir();
         let provider = CatalogProvider {
             name: "Test".into(),
-            env: vec!["OPENCODE_API_KEY"]
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
+            env: vec![UNSET_KEY_ENV.into()],
             npm: "@ai-sdk/openai-compatible".into(),
             api: None,
             models: HashMap::new(),
@@ -1573,7 +1587,7 @@ mod tests {
             "opencode".into(),
             CatalogProvider {
                 name: "Opencode".into(),
-                env: vec!["OPENCODE_API_KEY".into()],
+                env: vec![UNSET_KEY_ENV.into()],
                 npm: "@ai-sdk/openai-compatible".into(),
                 api: Some("https://opencode.ai/zen/v1".into()),
                 models,
@@ -2519,8 +2533,6 @@ mod tests {
     #[test]
     fn catalog_all_models_public_fallback_shows_only_free() {
         let (_tmp, state_dir) = temp_state_dir();
-        // Provider with OPENCODE_API_KEY in env but no key set gets "public" fallback.
-        // Only free (zero-cost) models should appear in all_models.
         let mut models = HashMap::new();
         models.insert(
             "free-model".into(),
@@ -2556,14 +2568,13 @@ mod tests {
             "opencode".into(),
             CatalogProvider {
                 name: "Opencode".into(),
-                env: vec!["OPENCODE_API_KEY".into()],
+                env: vec![UNSET_KEY_ENV.into()],
                 npm: "@ai-sdk/openai-compatible".into(),
                 api: Some("https://opencode.ai/zen/v1".into()),
                 models,
             },
         );
 
-        // No OPENCODE_API_KEY set in env — falls back to "public"
         let data = CatalogData::from_index(providers, &state_dir);
 
         let opencode = data.providers.get("opencode").unwrap();

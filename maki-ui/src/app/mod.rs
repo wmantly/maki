@@ -21,6 +21,7 @@ pub(crate) mod tests;
 pub(crate) mod view;
 
 use std::collections::HashMap;
+use std::env;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,7 +55,6 @@ use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
-use crate::image;
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
@@ -453,6 +453,7 @@ pub struct App {
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
+    pub(crate) primary_paste_rx: Vec<flume::Receiver<Option<String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
@@ -518,7 +519,11 @@ impl App {
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let input_box = InputBox::new(
-            InputHistory::load(&storage, input_history_size),
+            InputHistory::load(
+                &storage,
+                &env::current_dir().unwrap_or_else(|_| PathBuf::from(&state.session.cwd)),
+                input_history_size,
+            ),
             ui_config.max_input_lines,
         );
         let mut app = Self {
@@ -573,6 +578,7 @@ impl App {
             shared_history: None,
             btw_system: None,
             image_paste_rx: vec![],
+            primary_paste_rx: vec![],
             storage_writer,
             last_sent: None,
             shell: shell::ShellState::default(),
@@ -617,8 +623,12 @@ impl App {
         self.active_chat == 0
     }
 
-    fn plan_form_active(&self) -> bool {
+    fn plan_form_open(&self) -> bool {
         self.state.mode == Mode::Plan && self.plan_form.is_visible()
+    }
+
+    fn plan_form_active(&self) -> bool {
+        self.is_main_chat() && self.plan_form_open()
     }
 
     /// One diff per frame covers every way a model can change (the picker,
@@ -876,24 +886,12 @@ impl App {
         match msg {
             Msg::Key(key) => self.handle_key(key),
             Msg::Paste(text) => {
-                let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 if text.is_empty() {
                     if self.is_main_chat() && self.image_paste_rx.is_empty() {
                         self.start_image_paste();
                     }
                 } else {
-                    let mut any_image = false;
-                    if self.is_main_chat() {
-                        for line in text.lines() {
-                            if let Some((path, mt)) = image::try_parse_image_path(line) {
-                                self.start_file_image_paste(path, mt);
-                                any_image = true;
-                            }
-                        }
-                    }
-                    if !any_image {
-                        self.route_text_paste(&text);
-                    }
+                    self.insert_pasted(text);
                 }
                 vec![]
             }
@@ -2039,10 +2037,22 @@ impl App {
             return vec![];
         }
 
-        if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
+        if let ChatEventResult::PermissionRequest {
+            id,
+            tool,
+            scopes,
+            reason,
+        } = result
+        {
             let project_trusted = self.permissions.project_is_trusted();
-            self.permission_prompt
-                .push(id, tool, scopes, subagent_id.clone(), project_trusted);
+            self.permission_prompt.push(
+                id,
+                tool,
+                scopes,
+                subagent_id.clone(),
+                project_trusted,
+                reason,
+            );
             return vec![];
         }
 
@@ -2411,9 +2421,16 @@ impl App {
                 None => PathBuf::from(args),
             }
         };
-        match std::env::set_current_dir(&path) {
+        self.save_input_history();
+        match env::set_current_dir(&path) {
             Ok(()) => {
-                if let Ok(canonical) = std::env::current_dir() {
+                if let Ok(canonical) = env::current_dir() {
+                    let max_entries = self.input_box.history().max_entries();
+                    self.input_box.set_history(InputHistory::load(
+                        &self.storage,
+                        &canonical,
+                        max_entries,
+                    ));
                     self.state
                         .session_mut()
                         .set_cwd(canonical.to_string_lossy().into_owned());
@@ -2490,7 +2507,7 @@ impl App {
         if matches!(self.pending_input, PendingInput::AuthRetry { .. }) {
             return Some(Notification::AuthenticationRequired);
         }
-        if self.status != Status::Streaming && self.plan_form_active() {
+        if self.status != Status::Streaming && self.plan_form_open() {
             return Some(Notification::PlanReady);
         }
         self.float_mgr
@@ -2525,6 +2542,7 @@ impl App {
             | self.tick_edge_scroll()
             | self.tick_error_expiry()
             | self.poll_image_paste()
+            | self.poll_primary_paste()
             | self.btw_modal.poll()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()

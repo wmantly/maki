@@ -57,6 +57,7 @@ pub(crate) const RESEARCH_NAME: &str = "research";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
 const LATE_MODEL_SPEC: &str = "zai/glm-5";
+const PRIMARY_TEXT: &str = "selected text";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
@@ -105,6 +106,8 @@ const FIRST_ASK: &str = "ask-a";
 const SECOND_ASK: &str = "ask-b";
 const OTHER_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
 const EDIT_PLUGIN: &str = "completion";
+const CD_TARGET_DIR: &str = "other";
+const CD_TARGET_PROMPT: &str = "typed in the other project";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -523,6 +526,7 @@ fn tool_done_transitions_plan_to_ready(
     app.run_id = 1;
 
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "write".into(),
         output: Arc::new(output),
@@ -573,6 +577,28 @@ fn paste_file_path_triggers_image_load() {
     app.update(Msg::Paste("file:///tmp/nonexistent.png".into()));
     assert!(!app.image_paste_rx.is_empty());
     assert_eq!(app.input_box.buffer.value(), "");
+}
+
+#[test]
+fn paste_loads_every_image_path_in_the_text() {
+    let mut app = test_app();
+    app.update(Msg::Paste(
+        "file:///tmp/one.png\nnot an image\nfile:///tmp/two.jpg".into(),
+    ));
+    assert_eq!(app.image_paste_rx.len(), 2);
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+#[test_case(Some(PRIMARY_TEXT), PRIMARY_TEXT ; "selection_inserted")]
+#[test_case(None,               ""           ; "empty_selection_ignored")]
+fn primary_selection_read_lands_on_tick(selection: Option<&str>, expected: &str) {
+    let mut app = test_app();
+    let (tx, rx) = flume::bounded(1);
+    app.primary_paste_rx.push(rx);
+    tx.send(selection.map(String::from)).unwrap();
+    assert_eq!(app.tick(), Dirty::YES);
+    assert_eq!(app.input_box.buffer.value(), expected);
+    assert!(app.primary_paste_rx.is_empty());
 }
 
 #[test]
@@ -787,6 +813,22 @@ fn ctrl_c_closes_palette() {
 
     app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert!(!app.command_palette.is_active());
+}
+
+/// Plugins that only watch read the prompt here, instead of wrapping
+/// `agent.user_message` just to see it go by.
+#[test]
+fn turn_start_carries_what_the_user_typed() {
+    const TYPED: &str = "fix the parser";
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.start_from_queue(&queued_msg(TYPED));
+
+    let (event, data) = probe.try_recv_autocmd().expect("TurnStart fired");
+    assert_eq!(event, "TurnStart");
+    assert_eq!(data["text"], TYPED);
 }
 
 /// The event exists so plugins can drop what belonged to the session that
@@ -1551,6 +1593,7 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
     assert_eq!(data["tool"], "bash");
 
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "tool-1".into(),
         tool: "bash".into(),
         output: Arc::new(ToolOutput::Plain("done".into())),
@@ -1976,6 +2019,7 @@ pub(crate) fn close_subagent_transcript(app: &mut App, id: &str) {
 
 pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: id.into(),
         tool: "task".into(),
         output: Arc::new(ToolOutput::Plain("result".into())),
@@ -2779,6 +2823,7 @@ fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
         vec!["execute".into()],
         None,
         true,
+        None,
     );
 
     let planned = planned_edit(&app, 0, 5, "bye");
@@ -3721,6 +3766,28 @@ fn cd_command_behavior() {
 }
 
 #[test]
+fn cd_swaps_input_history_to_the_new_dir() {
+    let (tmp, dir, _writer, mut app) = tempdir_app();
+    let target = tmp.path().join(CD_TARGET_DIR);
+    fs::create_dir(&target).unwrap();
+    let target = maki_storage::paths::canonicalize_clean(&target);
+    let mut seeded = InputHistory::load(&dir, &target, app.input_box.history().max_entries());
+    seeded.push(CD_TARGET_PROMPT.into());
+    seeded.save().unwrap();
+
+    app.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: target.to_string_lossy().into_owned(),
+            bang: false,
+        },
+        0,
+    );
+
+    assert_eq!(app.input_box.history().get(0), Some(CD_TARGET_PROMPT));
+}
+
+#[test]
 fn typed_slash_command_executes() {
     let mut app = test_app();
     let actions = type_and_submit(&mut app, "/help");
@@ -3948,6 +4015,7 @@ fn compaction_lowers_the_stored_context_size() {
         context_size_before: MEASURED_CONTEXT,
         context_size_after: AFTER,
         context_window: 0,
+        summary: String::new(),
     }));
 
     assert_eq!(app.state.context_size, AFTER);
@@ -4104,6 +4172,7 @@ fn concurrent_subagent_permission_requests_are_each_answered() {
                 id: ask.into(),
                 tool: ToolKey::native("bash"),
                 scopes: vec!["ls".into()],
+                reason: None,
             },
             subagent: Some(subagent_info_with_tx(parent, RESEARCH_NAME, Some(tx))),
             run_id: 1,
@@ -4213,6 +4282,7 @@ fn search_reaches_output_that_lands_in_an_existing_segment() {
     app.update(Msg::Key(kb::SEARCH.to_key_event()));
 
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "tool-1".into(),
         tool: "bash".into(),
         output: Arc::new(ToolOutput::Plain(LATE_TEXT.into())),
@@ -4294,6 +4364,7 @@ fn mcp_toggle_dispatches_action() {
                 config_path: PathBuf::from("/tmp/config.toml"),
                 url: None,
                 oauth: None,
+                ca_file: None,
             }],
             prompts: vec![],
             pids: vec![],
@@ -4750,6 +4821,7 @@ fn plan_app() -> App {
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "write".into(),
         output: Arc::new(ToolOutput::Plain("wrote 42 bytes to test-plan.md".into())),
@@ -4769,6 +4841,7 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
     app.state.mode = mode;
     app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "write".into(),
         output: Arc::new(ToolOutput::Plain(
@@ -4803,6 +4876,7 @@ fn re_edit_keeps_plan_form_visible() {
 
     // Agent edits the plan again (second write to same path) — idempotent, stays Ready
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "t2".into(),
         tool: "write".into(),
         output: Arc::new(ToolOutput::Plain("wrote 50 bytes to test-plan.md".into())),
@@ -4873,6 +4947,7 @@ fn plan_form_open_editor() {
 
 fn rewrite_plan(app: &mut App) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        call: None,
         id: "t2".into(),
         tool: "write".into(),
         output: Arc::new(ToolOutput::Plain("wrote 99 bytes to test-plan.md".into())),
@@ -5584,6 +5659,7 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
         vec!["execute".into()],
         None,
         true,
+        None,
     );
 
     app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
@@ -6269,6 +6345,7 @@ fn ctrl_c_denies_permission_prompt() {
         vec!["execute".into()],
         None,
         true,
+        None,
     );
     assert!(app.permission_prompt.is_open());
 
@@ -6488,6 +6565,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         vec!["ls".into()],
         None,
         true,
+        None,
     );
 
     let (_msg, _bottom, _status, _input, splits) = app.layout_geometry(TEST_AREA);
@@ -6699,6 +6777,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         vec!["execute".into()],
         None,
         true,
+        None,
     );
     assert_eq!(
         app.attention(),
@@ -6714,6 +6793,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         vec![],
         None,
         true,
+        None,
     );
     assert_eq!(
         app.attention(),
@@ -6745,6 +6825,29 @@ fn attention_classifies_auth_and_ready_plan() {
     app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.state.mode = Mode::Build;
     assert_eq!(app.attention(), None);
+}
+
+#[test]
+fn plan_form_on_a_subtask_leaves_keys_alone_but_still_wants_attention() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "sub".into() },
+        TASK_ID,
+        Some("research"),
+    ));
+    app.status = Status::Idle;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.plan_form.on_plan_ready();
+    app.run_builtin(BuiltinAction::NextChat);
+    assert_eq!(app.active_chat, 1);
+
+    let parallel = app.plan_form.parallel();
+    app.update(Msg::Key(key(KeyCode::Char(' '))));
+    assert_eq!(app.plan_form.parallel(), parallel);
+    assert_eq!(app.attention(), Some(Notification::PlanReady));
 }
 
 fn tool_use_msg(id: &str) -> Message {
@@ -7206,6 +7309,7 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
 
     for tool_id in TOOL_IDS {
         app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
             id: tool_id.into(),
             tool: "bash".into(),
             output: Arc::new(ToolOutput::Plain(tool_text(tool_id).into())),

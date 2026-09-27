@@ -1,3 +1,4 @@
+mod child_env;
 pub(crate) mod error;
 pub(crate) mod image;
 pub(crate) mod manifest;
@@ -11,6 +12,7 @@ pub mod spec;
 pub mod tokens;
 pub(crate) mod types;
 
+pub use child_env::strip_provider_keys;
 pub use error::{AgentError, Overflow};
 pub use maki_storage::sessions::add_cost;
 pub use model::{
@@ -25,6 +27,7 @@ pub use providers::catalog::{
     catalog_providers_if_available, refresh_catalog, warm_catalog,
 };
 pub use providers::copilot::auth as copilot_auth;
+pub use providers::custom;
 pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
 pub use providers::xai::auth as xai_auth;
