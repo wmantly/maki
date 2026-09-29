@@ -9,14 +9,16 @@ use color_eyre::eyre::{Context, bail, eyre};
 use maki_config::{ModelPolicy, ProviderConfig};
 use maki_providers::model::{Model, ModelError, ModelTier};
 use maki_providers::provider::provider_for_slug;
-use maki_providers::spec::{Owner, ProviderRegistry};
-use maki_providers::{AgentError, Timeouts, custom, dynamic};
+use maki_providers::spec::ProviderRegistry;
+use maki_providers::{AgentError, Timeouts, custom, plugin};
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
 use maki_storage::model::read_model;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
+
+use crate::provider_scripts;
 
 const LOG_ENV: &str = "MAKI_LOG";
 const LOG_ENV_SHARED: &str = "RUST_LOG";
@@ -98,28 +100,30 @@ fn fallback_model(provider_config: &ProviderConfig) -> Result<Model> {
     })
 }
 
-/// Building a `providers/` script runs its `resolve`, which may pop a 1Password
-/// or Touch ID prompt. The real build right after would ask again, so here a
-/// script only has to be installed. If its `resolve` fails, that real build
-/// reports it instead of us quietly switching providers.
+/// A plugin provider that gets credentials from a hook resolves them on its
+/// first request, so being registered is enough here: broken credentials fail
+/// that request instead of quietly switching providers.
 fn provider_ready(slug: &str) -> Result<(), AgentError> {
-    if matches!(Owner::of(slug), Owner::Script) {
-        return Ok(());
-    }
     provider_for_slug(slug, Timeouts::default()).map(drop)
 }
 
 /// An unknown slug may just mean the models.dev catalog has not been loaded
 /// yet, so retry once with a warm catalog. `Model::from_spec` itself must stay
 /// non-blocking: the UI draws with it.
-fn from_spec_or_warm_catalog(spec: &str) -> Result<Model, ModelError> {
-    match Model::from_spec(spec) {
+fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
+    let result = match Model::from_spec(spec) {
         Err(ModelError::UnsupportedProvider(_)) => {
             maki_providers::warm_catalog();
             Model::from_spec(spec)
         }
         result => result,
+    };
+    if let Err(ModelError::UnsupportedProvider(slug)) = &result
+        && let Some(hint) = provider_scripts::unknown_provider_hint(slug)
+    {
+        bail!(hint);
     }
+    Ok(result?)
 }
 
 fn auto_detect_model(policy: &ModelPolicy) -> Option<Model> {
@@ -141,16 +145,20 @@ fn auto_detect_model(policy: &ModelPolicy) -> Option<Model> {
         })
 }
 
-/// Scripts in `providers/`, then `providers.toml` entries. They come after the
-/// built-ins so a key in the environment still wins, as it always did.
+/// Lua plugin providers that claim no built-in slug, then `providers.toml`
+/// entries. They come after the built-ins so a key in the environment still
+/// wins, as it always did. Sorted by slug, since the registry is a map and
+/// startup should pick the same provider every run.
 fn user_provider_models() -> impl Iterator<Item = Model> {
-    let scripts = dynamic::discovered_slugs()
+    let mut plugin_slugs = plugin::unclaimed_slugs();
+    plugin_slugs.sort_unstable();
+    let plugins = plugin_slugs
         .into_iter()
-        .flat_map(|slug| STARTUP_TIERS.map(|tier| Model::from_tier_dynamic(slug, tier)));
+        .flat_map(|slug| STARTUP_TIERS.map(|tier| Model::from_tier_dynamic(&slug, tier)));
     let custom = custom::startup_specs(&STARTUP_TIERS)
         .into_iter()
         .map(|spec| Model::from_spec(&spec));
-    scripts.chain(custom).filter_map(Result::ok)
+    plugins.chain(custom).filter_map(Result::ok)
 }
 
 /// Built-in slugs keep their compiled protocol, model catalog and auth wiring,

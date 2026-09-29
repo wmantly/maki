@@ -14,6 +14,7 @@ local MAX_SCRIPT_LINES = 2000
 local OPEN_READ_CHECK_LINES = 1
 local READ_INPUT_SLOTS = { "tool.read.input", "tool.*.input" }
 local OPEN_READ_HOOKED_ERR = "open() cannot read while a plugin hooks the read tool, call read() instead"
+local OPEN_APPEND_UNSUPPORTED_ERR = "open() cannot append because the write tool has no append option"
 local NO_OUTPUT = "(no output)"
 local SEPARATOR = "──────"
 local CANCELLED_ERR = "cancelled"
@@ -275,7 +276,9 @@ end
 -- yes and record the read, then take the real content straight from disk.
 -- A read hook may have pointed that check at another file, so while one is
 -- installed we refuse rather than read the path it steered away from.
-local function file_access(tools)
+-- A replacement write tool without `append` would drop the flag and overwrite
+-- the file, so appends are refused there.
+local function file_access(tools, schemas)
   local files = {}
   if tools.read then
     files.read = function(path)
@@ -293,7 +296,11 @@ local function file_access(tools)
     end
   end
   if tools.write then
+    local can_append = (schemas.write.properties or {}).append ~= nil
     files.write = function(path, content, append)
+      if append and not can_append then
+        return nil, OPEN_APPEND_UNSUPPORTED_ERR
+      end
       return tools.write({ path = path, content = content, append = append })
     end
   end
@@ -345,10 +352,11 @@ local function handler(input, ctx)
     return { llm_output = CALLABLE_TOOLS_ERR .. callable_err, is_error = true }
   end
 
-  local tools = {}
+  local tools, schemas = {}, {}
   for _, t in ipairs(interpreter_tools(callable, ctx:audience(), ctx:workflow())) do
     local bind, name = t.alias or t.name, t.name
     if bind:match(PY_IDENTIFIER) then
+      schemas[bind] = t.schema or {}
       tools[bind] = function(tool_input)
         if t.workflow_only then
           return maki.agent.call_tool(ctx, name, tool_input, {})
@@ -368,7 +376,7 @@ local function handler(input, ctx)
     preamble = PREAMBLE,
     on_output = show,
     tools = tools,
-    files = file_access(tools),
+    files = file_access(tools, schemas),
   })
 
   if err then

@@ -11,6 +11,7 @@ use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{
     DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, local_tool,
 };
+use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::PluginHost;
 
 const CODE_EXECUTION_SRC: &str = include_str!("../../plugins/code_execution/init.lua");
@@ -62,6 +63,14 @@ const REWRITING_READ_HOOK: &str = concat!(
 const WILDCARD_INPUT_HOOK: &str =
     r#"maki.api.set_slot("tool.*.input", function(prev, input) return input end)"#;
 const NO_POLICY: &str = "";
+const OPEN_APPEND_REFUSED: &str = "write tool has no append option";
+const WRITE_WITHOUT_APPEND: &str = r#"maki.api.register_tool({
+    name = "write",
+    description = "replacement write without append",
+    audiences = { "main", "interpreter" },
+    schema = { type = "object", properties = { path = { type = "string" }, content = { type = "string" } } },
+    handler = function(input) maki.fs.write(input.path, input.content) return "ok" end,
+})"#;
 
 fn fixture_plugin() -> String {
     format!(
@@ -310,11 +319,12 @@ fn parallel_edits_to_one_file_all_apply() {
 
 /// Binds `path` to a file holding [`OPEN_ORIGINAL`] and returns the script's
 /// result with what the file holds afterwards. `policy` is Lua loaded next to
-/// the builtins.
+/// the builtins, minus the `disabled` ones.
 fn run_on_file(
     code: &str,
     policy: &str,
     shape: fn(&mut ToolContext),
+    disabled: &[&str],
 ) -> (Result<String, String>, String) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join(OPEN_TARGET);
@@ -322,7 +332,20 @@ fn run_on_file(
     let quoted = path.to_str().expect("utf-8 temp path");
 
     let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig::from_plugins(
+        disabled
+            .iter()
+            .map(|name| {
+                let off = PluginFileConfig {
+                    enabled: Some(false),
+                    ..PluginFileConfig::default()
+                };
+                ((*name).to_owned(), off)
+            })
+            .collect(),
+    ))
+    .unwrap();
     host.load_source("policy", policy).unwrap();
     let out = exec_code(
         &reg,
@@ -335,9 +358,20 @@ fn run_on_file(
 #[test_case::test_case("text = open(path).read()\nwith open(path, 'w') as f:\n    f.write(text.upper())", "HELLO\n" ; "read_then_write")]
 #[test_case::test_case("with open(path, 'a') as f:\n    f.write('world\\n')\n    f.write('!')", "hello\nworld\n!" ; "append")]
 fn open_reads_and_writes_through_the_file_tools(code: &str, expected: &str) {
-    let (out, content) = run_on_file(code, NO_POLICY, |_| {});
+    let (out, content) = run_on_file(code, NO_POLICY, |_| {}, &[]);
     out.expect("open must be served");
     assert_eq!(content, expected);
+}
+
+/// Validation drops the `append` flag a replacement tool does not declare, so
+/// going ahead would overwrite the file with only the new text.
+#[test]
+fn open_append_is_refused_when_the_write_tool_cannot_append() {
+    let code = "with open(path, 'a') as f:\n    f.write('world')";
+    let (out, content) = run_on_file(code, WRITE_WITHOUT_APPEND, |_| {}, &["write"]);
+    let err = out.expect_err("the append must be refused");
+    assert!(err.contains(OPEN_APPEND_REFUSED), "got: {err}");
+    assert_eq!(content, OPEN_ORIGINAL);
 }
 
 /// `open()` reads the file itself, so it cannot follow a hook that points the
@@ -350,7 +384,7 @@ fn open_reads_are_refused_while_the_read_tool_is_hooked(policy: &str) {
     let code = format!(
         "try:\n    out = open(path).read()\nexcept OSError:\n    out = '{OPEN_REFUSED}'\nout"
     );
-    let (out, _) = run_on_file(&code, policy, |_| {});
+    let (out, _) = run_on_file(&code, policy, |_| {}, &[]);
     let out = out.expect("the refusal must reach the script as OSError");
     assert!(out.contains(OPEN_REFUSED), "got: {out}");
 }
@@ -358,7 +392,7 @@ fn open_reads_are_refused_while_the_read_tool_is_hooked(policy: &str) {
 #[test_case::test_case(|ctx| ctx.audience = ToolAudience::RESEARCH_SUB ; "write_tool_not_callable")]
 #[test_case::test_case(|ctx| ctx.mode = AgentMode::Plan(PLAN_FILE.into()) ; "plan_mode_blocks_the_write_tool")]
 fn open_for_writing_is_refused_where_the_write_tool_is(shape: fn(&mut ToolContext)) {
-    let (out, content) = run_on_file("open(path, 'w').write('x')", NO_POLICY, shape);
+    let (out, content) = run_on_file("open(path, 'w').write('x')", NO_POLICY, shape, &[]);
     let err = out.expect_err("the write must be refused");
     assert!(err.contains(FILE_WRITE_FAILED), "got: {err}");
     assert_eq!(content, OPEN_ORIGINAL);

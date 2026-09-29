@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::absolute;
 use std::time::Duration;
 
 use monty::{MontyRun, RunProgress};
@@ -290,8 +291,8 @@ fn drive(
 /// Keeps what the script writes with `open()` and `pathlib` in memory until
 /// someone could look at the file: a tool call, a read of that path, or the end
 /// of the run. A loop of `f.write` then turns into a single host write, and a
-/// cancelled run drops what is still waiting here. Paths are matched as the
-/// script typed them, so reading `./a` does not flush a write to `a`.
+/// cancelled run drops what is still waiting here. Paths are matched once made
+/// absolute, so `a` and `./a` share one entry and the last write wins.
 struct FileHost<'a> {
     files: Option<&'a FileFn>,
     pending: Vec<FileWrite>,
@@ -341,7 +342,7 @@ impl FileHost<'_> {
     }
 
     fn read(&mut self, path: String) -> Result<MontyObject, String> {
-        if let Some(index) = self.pending.iter().position(|w| w.path == path) {
+        if let Some(index) = self.pending.iter().position(|w| same_file(&w.path, &path)) {
             self.flush_at(index)?;
         }
         self.call(FileOp::Read(path)).map(MontyObject::String)
@@ -360,7 +361,11 @@ impl FileHost<'_> {
     }
 
     fn buffer(&mut self, write: FileWrite) {
-        match self.pending.iter_mut().find(|w| w.path == write.path) {
+        match self
+            .pending
+            .iter_mut()
+            .find(|w| same_file(&w.path, &write.path))
+        {
             Some(pending) if write.append => pending.content.push_str(&write.content),
             Some(pending) => *pending = write,
             None => self.pending.push(write),
@@ -385,6 +390,11 @@ impl FileHost<'_> {
             .map(drop)
             .map_err(|e| format!("{path}: {e}"))
     }
+}
+
+/// Lexical only, like the host tools resolve paths, so symlinks still differ.
+fn same_file(a: &str, b: &str) -> bool {
+    a == b || matches!((absolute(a), absolute(b)), (Ok(a), Ok(b)) if a == b)
 }
 
 /// Monty counts lines in the whole script, so user frames come back
@@ -739,6 +749,7 @@ mod tests {
     #[test_case("open(path, 'w')", "" ; "write_mode_without_writes_empties")]
     #[test_case("with open(path, 'a') as f:\n    f.write('a')\n    f.write('b')", "oldab" ; "append_mode_appends")]
     #[test_case("from pathlib import Path\nPath(path).write_text('ab')", "ab" ; "pathlib_write_text")]
+    #[test_case("open(path, 'w').write('1')\nopen('./' + path, 'w').write('2')\nopen(path, 'w').write('3')", "3" ; "one_file_two_spellings")]
     fn buffered_writes_reach_the_host_once(code: &str, expected: &str) {
         let fs = memory_fs();
         run_with_files(code, &fs, false).unwrap();
