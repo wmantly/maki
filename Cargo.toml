@@ -10,7 +10,7 @@ homepage = "https://maki.sh"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "tui", "coding"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.88"
+rust-version = "1.95"
 
 [[bin]]
 name = "maki"
@@ -82,7 +82,7 @@ edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/tontinton/maki"
-rust-version = "1.88"
+rust-version = "1.95"
 
 [workspace.dependencies]
 maki-agent = { path = "maki-agent" }
@@ -149,7 +149,6 @@ arboard = { version = "3", default-features = false, features = ["image-data", "
 image = { version = "0.25", default-features = false, features = ["png"] }
 fast_qr = { version = "0.14", features = ["svg"] }
 flume = { version = "0.11", default-features = false, features = ["async", "select"] }
-fs4 = "1"
 pin-project-lite = "0.2"
 rustix = { version = "1", default-features = false, features = ["process"] }
 humantime = "2"

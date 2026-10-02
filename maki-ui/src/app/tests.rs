@@ -13,6 +13,7 @@ use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
+use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
@@ -37,7 +38,6 @@ use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Modifier;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,8 +87,8 @@ const WAIT_AHEAD: Duration = Duration::from_secs(60);
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
 const CURSOR_ON_SCREEN: &str = "the reported cursor must be on screen";
-const CURSOR_ON_REVERSED_CELL: &str = "the focused input box owns a reversed cursor cell";
-const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so no cell is reversed";
+const CURSOR_ON_STYLED_CELL: &str = "the focused input box owns a cell painted as the cursor";
+const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so no cell is a cursor";
 /// Stands in for a size the provider measured, baseline included.
 const MEASURED_CONTEXT: u32 = 100_000;
 const TEST_MODEL_SPEC: &str = "test-model";
@@ -213,7 +213,7 @@ fn app_without_splash() -> App {
 
 /// Hands back the slot providers publish their model lists into, since the app
 /// keeps no handle to it once the picker owns it.
-fn app_with_model_slot() -> (App, Arc<ArcSwapOption<Vec<String>>>) {
+fn app_with_model_slot() -> (App, Arc<ArcSwapOption<ModelList>>) {
     let models = Arc::new(ArcSwapOption::empty());
     let mut app = test_app();
     app.model_picker = ModelPicker::new(Arc::clone(&models));
@@ -2492,7 +2492,10 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
     assert!(app.model_picker.is_open());
 
     assert_owes_one_frame(&mut app, || {
-        models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
+        models.store(Some(Arc::new(ModelList {
+            specs: vec![LATE_MODEL_SPEC.into()],
+            loading: false,
+        })));
     });
 }
 
@@ -2558,7 +2561,7 @@ fn rendered(app: &mut App) -> String {
 
 /// The event loop parks the terminal cursor on whatever `view` reports, so an
 /// IME anchors its preedit text there. The report has to be the very cell the
-/// input box reversed for its software cursor, and the hardware cursor has to
+/// input box painted for its software cursor, and the hardware cursor has to
 /// stay hidden: shown, it would invert that cell back to plain text.
 #[test]
 fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
@@ -2578,13 +2581,13 @@ fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
                 .buffer()
                 .cell(pos)
                 .expect(CURSOR_ON_SCREEN);
-            (pos, cell.modifier.contains(Modifier::REVERSED))
+            (pos, theme::is_caret_cell(cell))
         })
     };
 
     assert!(
         matches!(draw(&mut app), Some((_, true))),
-        "{CURSOR_ON_REVERSED_CELL}"
+        "{CURSOR_ON_STYLED_CELL}"
     );
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
@@ -7005,11 +7008,7 @@ fn tool_use_msg(id: &str) -> Message {
 fn tool_result_msg(id: &str, text: &str) -> Message {
     Message {
         role: Role::User,
-        content: vec![ContentBlock::ToolResult {
-            tool_use_id: id.into(),
-            content: text.into(),
-            is_error: false,
-        }],
+        content: vec![ContentBlock::tool_result(id, text, false)],
         display_text: Some(String::new()),
         ..Default::default()
     }
@@ -7789,6 +7788,7 @@ fn remote_snapshot_renders_transcript_and_stats() {
                 tool_use_id: "tool-1".into(),
                 content: "out".into(),
                 is_error: false,
+                loaded_tools: Vec::new(),
             }],
             display_text: Some(String::new()),
             ..Default::default()
@@ -7862,6 +7862,7 @@ fn remote_snapshot_prefers_stored_tool_output_over_inline_summary() {
             tool_use_id: "tool-1".into(),
             content: "truncated summary…".into(),
             is_error: false,
+            loaded_tools: Vec::new(),
         }],
         display_text: Some(String::new()),
         ..Default::default()
@@ -7885,6 +7886,7 @@ fn remote_snapshot_keeps_the_full_image_output_not_just_its_caption() {
             tool_use_id: "tool-1".into(),
             content: "[image: pic.png 3B]".into(),
             is_error: false,
+            loaded_tools: Vec::new(),
         }],
         display_text: Some(String::new()),
         ..Default::default()
