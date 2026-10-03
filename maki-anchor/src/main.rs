@@ -506,7 +506,11 @@ fn new_token() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("rng failed");
     let digest = Sha256::digest(bytes);
-    format!("{:x}", digest)[..32].to_string()
+    digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()[..32]
+        .to_string()
 }
 
 /// Where the listener binds: the flag still wins over the file, and the
