@@ -105,6 +105,8 @@ pub struct EventLoopParams {
     pub focused: usize,
     pub startup_warnings: Vec<String>,
     pub startup_notice: Option<String>,
+    /// Shown in a popup that stays up until dismissed, not a flash.
+    pub startup_alert: Option<String>,
     pub storage: StateDir,
     pub config: AgentConfig,
     pub ui_config: UiConfig,
@@ -434,8 +436,10 @@ impl SpawnCtx {
                 id: SessionRef::from(session.id),
                 history: session.messages().to_vec(),
                 context_size: session.meta.context_size,
+                frame: session.frame().cloned(),
                 // The tab owns the session and persists it through
-                // `StorageWriter`, so the agent gets the transcript only.
+                // `StorageWriter`, so the agent only gets the transcript and
+                // the frame it was sent under.
                 session: None,
             },
             self.config.clone(),
@@ -596,6 +600,7 @@ impl<'t> EventLoop<'t> {
             focused,
             mut startup_warnings,
             startup_notice,
+            startup_alert,
             storage,
             config,
             ui_config,
@@ -709,6 +714,9 @@ impl<'t> EventLoop<'t> {
         }
         for warning in startup_warnings {
             app.queue_flash(warning);
+        }
+        if let Some(alert) = startup_alert {
+            app.alert_modal.open(alert);
         }
 
         let (pack_tx, pack_rx) = flume::unbounded();
@@ -1868,9 +1876,11 @@ impl<'t> EventLoop<'t> {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
                 let run_id = rt.app.run_id;
+                let workflow = rt.app.state.workflow;
                 rt.handles.queue.push(QueueItem::Compact(Compaction {
                     run_id,
                     instructions,
+                    workflow,
                 }));
             }
             Action::ToggleMcp(server_name, enabled) => {

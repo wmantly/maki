@@ -524,10 +524,10 @@ fn add_stdio(lua: &Lua, ctx: &Table) -> LuaResult<()> {
     )?;
     ctx.set(
         "prompt",
-        lua.create_function(|_, opts: Table| {
+        lua.create_async_function(|_, opts: Table| async move {
             let label: String = opts.get("label").unwrap_or_default();
             let secret = opts.get::<Option<bool>>("secret")?.unwrap_or(false);
-            Ok(read_answer(&label, secret))
+            Ok(smol::unblock(move || read_answer(&label, secret)).await)
         })?,
     )?;
     ctx.set(
@@ -539,7 +539,8 @@ fn add_stdio(lua: &Lua, ctx: &Table) -> LuaResult<()> {
     )
 }
 
-/// Reads one line of an answer from the terminal.
+/// Reads one line of an answer from the terminal, off the Lua thread so a slow
+/// typist does not trip the 5s watchdog.
 ///
 /// A secret is read with the terminal in raw mode so the characters never reach
 /// the scrollback, and echoed as mask characters so there is still feedback
@@ -636,15 +637,17 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 ///
 /// {spec} fields:
 ///   `slug` (string) Required. Letters, digits, `_` and `-`, starting with a
-///           letter or digit. Must not be a slug Maki ships or one defined in
-///           `providers.toml`.
+///           letter or digit. Must not be a slug Maki ships, one it serves
+///           from models.dev, or one defined in `providers.toml`.
 ///   `display_name` (string) Required. Shown in the UI.
 ///   `codec` (string) Wire format: `"openai"`, `"openai-responses"`,
 ///           `"anthropic"` or `"google"`.
 ///   `base` (string) A native provider to borrow whole, e.g. `"ollama"`.
 ///           Prefer `codec` for a new provider.
 ///   `base_url` (string) Default origin. Must be `https`, or `http` on
-///           loopback, and its host must match `net_hosts`.
+///           loopback, and its host must match `net_hosts`. Only with
+///           `codec`. A `base` moves only to an origin the `auth` hook
+///           returns, so plans with a `base_url` need a `codec` too.
 ///   `api_key_env` (string) Env var holding the API key, re-read each time
 ///           the provider is built. Sent as `x-api-key` for anthropic,
 ///           `x-goog-api-key` for google, and a bearer token otherwise.

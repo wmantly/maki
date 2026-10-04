@@ -22,6 +22,7 @@ use crate::provider::{BoxFuture, Provider};
 use crate::spec::{BASES, ProviderRegistry, ProviderSpec};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
+use super::catalog;
 use super::codec::{self, BodyHook, CodecOptions, RequestCtx};
 pub use super::codec::{EffortField, OpenAiWire, SessionCarrier, ThinkingWire};
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
@@ -31,6 +32,7 @@ mod spec;
 const BUILD_BODY_OPTION: &str = "build_body hook";
 const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
 const OPENAI_OPTION: &str = "openai";
+const BASE_URL_OPTION: &str = "base_url";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
 const LOCALHOST: &str = "localhost";
@@ -127,9 +129,12 @@ fn declared_base_url(
              https, or http only for loopback"
         ));
     }
-    if !host_allowed(host, hosts) {
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| format!("provider '{slug}': base_url '{url}' has no port"))?;
+    if !host_allowed(host, port, hosts) {
         return Err(format!(
-            "provider '{slug}': base_url host '{host}' is not in the declared net hosts"
+            "provider '{slug}': base_url '{host}:{port}' is not in the declared net hosts"
         ));
     }
     Ok(base_url)
@@ -297,7 +302,7 @@ pub enum RegisterError {
     InvalidSlug(String),
     #[error("provider slug '{0}' is already defined in providers.toml")]
     ConfiguredSlug(String),
-    #[error("provider slug '{0}' belongs to a built-in provider")]
+    #[error("provider slug '{0}' belongs to a built-in or models.dev provider")]
     ReservedSlug(String),
     #[error("provider '{slug}': {message}")]
     Credentials { slug: String, message: String },
@@ -390,6 +395,16 @@ fn honours_openai_wire(target: Target) -> bool {
 /// reach the same constructor and must answer alike.
 fn honours_system_prefix(target: Target) -> bool {
     target.spec().slug != super::google::SLUG
+}
+
+/// A base is the native provider whole, and the native only moves for an
+/// origin in its auth, which only an auth hook writes. A static one would be
+/// dropped and the key sent to the vendor's own host.
+fn honours_base_url(target: Target) -> bool {
+    match target {
+        Target::Codec(_) => true,
+        Target::Base(_) => false,
+    }
 }
 
 pub fn is_valid_slug(s: &str) -> bool {
@@ -516,12 +531,15 @@ fn register_owned(
     if !is_valid_slug(&slug) {
         return Err(RegisterError::InvalidSlug(slug));
     }
-    // A third party on a slug maki ships would be handed the key the user
-    // saved for that provider. A bundled slug stays reserved even while its
-    // plugin is off, so turning a plugin off never frees the name.
+    // A third party on a slug maki ships or serves from models.dev would be
+    // handed the key the user saved for that provider, and would take over
+    // its models. A bundled slug stays reserved even while its plugin is off,
+    // so turning a plugin off never frees the name.
     let reserved = match authority {
         DeclAuthority::Bundled => ProviderRegistry::compiled(&slug).is_some(),
-        DeclAuthority::ThirdParty => ProviderRegistry::is_shipped(&slug),
+        DeclAuthority::ThirdParty => {
+            ProviderRegistry::is_shipped(&slug) || catalog::serves_slug(&slug)
+        }
     };
     if reserved {
         return Err(RegisterError::ReservedSlug(slug));
@@ -625,6 +643,11 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     }
     if decl.openai.is_some() && !honours_openai_wire(target) {
         return Err(unsupported(OPENAI_OPTION));
+    }
+    let states_origin =
+        decl.base_url.is_some() || decl.plans.iter().any(|plan| plan.base_url.is_some());
+    if states_origin && !honours_base_url(target) {
+        return Err(unsupported(BASE_URL_OPTION));
     }
     Ok(target)
 }
@@ -1298,13 +1321,20 @@ fn resolve_base_url(entry: &PluginEntry) -> Option<(String, OriginChooser)> {
     Some((planned, OriginChooser::Plugin))
 }
 
-/// The host of [`effective_base_url`], for a caller deciding whether an
+/// The `host:port` of [`effective_base_url`], for a caller deciding whether an
 /// outbound request is one this provider is already making. Every origin that
 /// can win there was either vetted at registration (the declaration's own, a
 /// hook's) or stated by the user (`<SLUG>_BASE_URL`, `providers.toml`).
-pub fn effective_host(slug: &str) -> Option<String> {
-    let base_url = effective_base_url(slug)?;
-    Some(Url::parse(&base_url).ok()?.host_str()?.to_owned())
+///
+/// The port is always written out, even the default one. This string is
+/// matched as a `net_hosts` pattern, and a bare host there means every port.
+pub fn effective_authority(slug: &str) -> Option<String> {
+    let base_url = Url::parse(&effective_base_url(slug)?).ok()?;
+    Some(format!(
+        "{}:{}",
+        base_url.host_str()?,
+        base_url.port_or_known_default()?
+    ))
 }
 
 pub fn spec(slug: &str) -> Option<&'static ProviderSpec> {
@@ -1467,6 +1497,15 @@ mod tests {
             decl: decl(slug),
             hooks: ProviderHooks::default(),
         }
+    }
+
+    /// Borrows `base` whole, so it states no origin of its own.
+    fn based(slug: &str, base: &str) -> Registration {
+        let mut reg = registration(slug);
+        reg.decl.codec = None;
+        reg.decl.base = Some(base.to_string());
+        reg.decl.base_url = None;
+        reg
     }
 
     /// A test registers the way a plugin load does: open the window, register,
@@ -1833,9 +1872,11 @@ mod tests {
         const SLUG: &str = "header-plugin";
         const ENV_VAR: &str = "MAKI_TEST_HEADER_PLUGIN_KEY";
         const KEY: &str = "sk-header";
-        let mut reg = registration(SLUG);
+        let mut reg = match base {
+            Some(base) => based(SLUG, base),
+            None => registration(SLUG),
+        };
         reg.decl.codec = codec;
-        reg.decl.base = base.map(str::to_string);
         reg.decl.api_key_env = Some(ENV_VAR.to_string());
         unsafe { std::env::set_var(ENV_VAR, KEY) };
         register_loaded(reg).unwrap();
@@ -1884,10 +1925,7 @@ mod tests {
     #[test]
     fn the_anthropic_base_lends_fast_mode() {
         const SLUG: &str = "fast-plugin";
-        let mut reg = registration(SLUG);
-        reg.decl.codec = None;
-        reg.decl.base = Some(super::super::anthropic::SLUG.to_string());
-        register_loaded(reg).unwrap();
+        register_loaded(based(SLUG, super::super::anthropic::SLUG)).unwrap();
 
         let fast_id = ProviderRegistry::compiled(super::super::anthropic::SLUG)
             .unwrap()
@@ -1906,10 +1944,7 @@ mod tests {
     #[test]
     fn a_base_lends_the_rows_a_declaration_leaves_out() {
         const SLUG: &str = "lending-plugin";
-        let mut reg = registration(SLUG);
-        reg.decl.codec = None;
-        reg.decl.base = Some(super::super::anthropic::SLUG.to_string());
-        register_loaded(reg).unwrap();
+        register_loaded(based(SLUG, super::super::anthropic::SLUG)).unwrap();
 
         let base = ProviderRegistry::compiled(super::super::anthropic::SLUG).unwrap();
         let lent = base
@@ -2041,6 +2076,47 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1, "{REJECTED_TWICE}");
     }
 
+    /// Anthropic and Google know their vendor's host, so before they took the
+    /// declared origin a key meant for a gateway went to the vendor instead.
+    #[test_case(Protocol::Anthropic, "anthropic-origin-plugin" ; "anthropic")]
+    #[test_case(Protocol::Google, "google-origin-plugin" ; "google")]
+    fn every_codec_posts_to_the_declared_origin(protocol: Protocol, slug: &str) {
+        const ENV_VAR: &str = "MAKI_TEST_CODEC_ORIGIN_KEY";
+        const KEY: &str = "sk-gateway";
+        const PROMPT: &str = "hi";
+        const SCRIPT: &[Canned] = &[Canned::json(401, r#"{"error":{"message":"no"}}"#)];
+        const MISSED_ORIGIN: &str = "the request did not reach the declared origin";
+
+        let (base_url, requests) = serve(SCRIPT);
+        let host = Url::parse(&base_url)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_owned();
+        unsafe { std::env::set_var(ENV_VAR, KEY) };
+        let mut reg = registration(slug);
+        reg.decl.codec = Some(protocol);
+        reg.decl.base_url = Some(base_url);
+        reg.decl.net_hosts = vec![host];
+        reg.decl.api_key_env = Some(ENV_VAR.to_string());
+        register_loaded(reg).unwrap();
+
+        let provider = create(slug, Timeouts::default()).unwrap();
+        let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
+        let (tx, _rx) = flume::unbounded();
+        let _ = smol::block_on(provider.stream_message(
+            &model,
+            &[Message::user(PROMPT.to_owned())],
+            "",
+            &serde_json::json!([]),
+            &tx,
+            RequestOptions::default(),
+            None,
+        ));
+
+        assert_eq!(requests.lock().unwrap().len(), 1, "{MISSED_ORIGIN}");
+    }
+
     /// Only an origin the user or maki chose skips the side-call guard, never
     /// the one a third-party decl wrote.
     #[test_case(DeclAuthority::ThirdParty, None, None ; "third_party_declared_origin")]
@@ -2059,6 +2135,18 @@ mod tests {
 
         let expected = expected.map(|url| Url::parse(url).unwrap());
         assert_eq!(vouched_origin(SLUG), expected);
+    }
+
+    #[test_case(None, "example.com:443" ; "the_default_port_spelled_out")]
+    #[test_case(Some("http://[::1]:8080/v1"), "[::1]:8080" ; "an_ipv6_origin")]
+    fn effective_authority_names_the_port(configured: Option<&str>, expected: &str) {
+        const SLUG: &str = "authority-plugin";
+        if let Some(configured) = configured {
+            unsafe { std::env::set_var(base_url_env_var(SLUG), configured) };
+        }
+        register_loaded_as(registration(SLUG), DeclAuthority::ThirdParty).unwrap();
+
+        assert_eq!(effective_authority(SLUG).as_deref(), Some(expected));
     }
 
     #[test]
@@ -2091,11 +2179,10 @@ mod tests {
     #[test_case(Some(BUILTIN_SLUG) ; "base_lends_its_provider")]
     fn undeclared_curation_and_limits(base: Option<&str>) {
         const SLUG: &str = "defaults-plugin";
-        let mut reg = registration(SLUG);
-        if let Some(base) = base {
-            reg.decl.codec = None;
-            reg.decl.base = Some(base.to_string());
-        }
+        let reg = match base {
+            Some(base) => based(SLUG, base),
+            None => registration(SLUG),
+        };
         register_loaded(reg).unwrap();
 
         let row = spec(SLUG).unwrap();
@@ -2316,6 +2403,12 @@ mod tests {
         reg.decl.system_prefix = Some(SOME_SYSTEM_PREFIX.to_string());
     }
 
+    /// A base only moves for an origin its auth hook returns.
+    fn base_url_on_a_base(reg: &mut Registration) {
+        reg.decl.codec = None;
+        reg.decl.base = Some(super::super::anthropic::SLUG.to_string());
+    }
+
     fn base_url_off_the_declared_hosts(reg: &mut Registration) {
         reg.decl.base_url = Some(UNDECLARED_BASE_URL.to_string());
     }
@@ -2340,6 +2433,7 @@ mod tests {
     #[test_case(openai_wire_on_anthropic, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "openai_table_needs_the_openai_codec")]
     #[test_case(system_prefix_on_google, |e| matches!(e, RegisterError::Unsupported { .. }) ; "google_drops_the_system_prefix")]
     #[test_case(system_prefix_on_the_google_base, |e| matches!(e, RegisterError::Unsupported { .. }) ; "so_does_the_google_base")]
+    #[test_case(base_url_on_a_base, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == BASE_URL_OPTION) ; "base_url_needs_a_codec")]
     #[test_case(base_url_off_the_declared_hosts, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "base_url_must_be_declared")]
     #[test_case(base_url_over_plain_http, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "base_url_must_be_https")]
     #[test_case(plan_off_the_declared_hosts, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "plan_base_url_must_be_declared")]
@@ -2366,6 +2460,31 @@ mod tests {
 
         assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
         assert!(!is_registered(slug), "{RESERVED_SLUG_TAKEN}");
+    }
+
+    /// `maki auth login` saves a models.dev provider's key under its slug, so
+    /// a package declaring that slug would be handed the key and take over
+    /// the provider's models.
+    #[test]
+    fn a_served_catalog_slug_is_reserved_for_third_parties() {
+        const CATALOG_SLUG: &str = "served-catalog";
+        let provider = catalog::schema::CatalogProvider {
+            name: DISPLAY_NAME.into(),
+            env: Vec::new(),
+            npm: catalog::ALLOWED_NPM[0].into(),
+            api: Some(EXAMPLE_BASE_URL.into()),
+            models: HashMap::new(),
+        };
+        catalog::seed_catalog_for_tests(
+            HashMap::from([(CATALOG_SLUG.into(), provider)]),
+            StateDir::from_path(Default::default()),
+        );
+
+        let error =
+            register_loaded_as(registration(CATALOG_SLUG), DeclAuthority::ThirdParty).unwrap_err();
+
+        assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
+        assert!(!is_registered(CATALOG_SLUG), "{RESERVED_SLUG_TAKEN}");
     }
 
     const UPSTREAM_SAID_NO: &str = "upstream said no";
@@ -2456,6 +2575,19 @@ mod tests {
     #[test_case("ftp://example.com/v1", EXAMPLE_HOST, false ; "a_scheme_that_is_neither")]
     fn base_url_scheme(url: &str, host: &str, accepted: bool) {
         const SLUG: &str = "scheme-plugin";
+        let hosts = vec![host.to_string()];
+        assert_eq!(
+            declared_base_url(SLUG, Some(url.to_string()), &hosts).is_ok(),
+            accepted,
+            "{url}"
+        );
+    }
+
+    #[test_case("https://example.com/v1", "example.com:443", true ; "the_default_port_is_the_declared_one")]
+    #[test_case("https://example.com:9443/v1", "example.com:443", false ; "another_port")]
+    #[test_case("http://[::1]:8080/v1", "[::1]:8080", true ; "a_loopback_ipv6_on_its_port")]
+    fn base_url_port(url: &str, host: &str, accepted: bool) {
+        const SLUG: &str = "port-plugin";
         let hosts = vec![host.to_string()];
         assert_eq!(
             declared_base_url(SLUG, Some(url.to_string()), &hosts).is_ok(),

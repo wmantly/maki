@@ -22,7 +22,10 @@ use crate::providers::{anthropic, custom, plugin};
 use crate::spec::{ProviderRegistry, ProviderSpec};
 use crate::types::{EffortDialect, FALLBACK_MAX_THINKING_BUDGET, dialect};
 pub use maki_config::providers::ModelTier;
-use maki_config::providers::{ProviderDef, ProvidersConfig, ThinkingFields};
+use maki_config::providers::{
+    ProviderDef, ProvidersConfig, ThinkingFields, base_url_override, builtin_provider,
+};
+use url::Url;
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -255,6 +258,11 @@ pub struct ModelEntry {
     /// Gates vision-only tools (`view_image`) and image blocks at request time.
     #[serde(default)]
     pub supports_vision: Option<bool>,
+    /// Whether the model can load deferred tools (see
+    /// [`Model::supports_deferred_tools`]). `None` is unknown: a no on a
+    /// built-in endpoint, a yes on one the user declared capable.
+    #[serde(default)]
+    pub supports_deferred_tools: Option<bool>,
     /// `None` when the provider never published one. A plugin row that leaves
     /// it out takes its provider's, see [`crate::plugin::ProviderDecl`].
     #[serde(default)]
@@ -408,10 +416,40 @@ impl ModelFamily {
 
 const FAST_PROVIDER: &str = "anthropic";
 
-fn deferred_tools_support(slug: &str, def: Option<&ProviderDef>) -> bool {
-    def.and_then(|def| def.supports_deferred_tools)
-        .or_else(|| ProviderRegistry::get(slug).map(|spec| spec.supports_deferred_tools))
-        .unwrap_or(false)
+/// Who vouches that an endpoint loads deferred tools.
+#[derive(Debug, PartialEq, Eq)]
+enum DeferralEndpoint {
+    Unsupported,
+    /// A built-in provider at its own URL. Only models its table marks
+    /// capable defer, since a wrong yes is a 400 on every request.
+    Builtin,
+    /// The user said so in `providers.toml`, so only a curated no outranks it.
+    Declared,
+}
+
+/// `configured_url` is a base URL the user set. A built-in's capability
+/// belongs to its own host: a proxy in front of it may not pass
+/// `tool_reference` blocks, so it has to be declared.
+fn deferral_endpoint(
+    slug: &str,
+    def: Option<&ProviderDef>,
+    configured_url: Option<&str>,
+) -> DeferralEndpoint {
+    match def.and_then(|def| def.supports_deferred_tools) {
+        Some(true) => return DeferralEndpoint::Declared,
+        Some(false) => return DeferralEndpoint::Unsupported,
+        None => {}
+    }
+    let builtin = ProviderRegistry::get(slug).is_some_and(|spec| spec.supports_deferred_tools);
+    let host = |url: &str| Url::parse(url).ok()?.host_str().map(str::to_owned);
+    let rerouted = configured_url.is_some_and(|configured| {
+        builtin_provider(slug).is_none_or(|b| host(configured) != host(b.default_base_url))
+    });
+    if builtin && !rerouted {
+        DeferralEndpoint::Builtin
+    } else {
+        DeferralEndpoint::Unsupported
+    }
 }
 
 /// The thinking keys a `providers.toml` entry may lend a builtin local model
@@ -743,13 +781,22 @@ impl Model {
     /// through `tool_reference` blocks, so a mid-session load never rewrites
     /// the cached tools prefix.
     ///
-    /// The `providers.toml` row's word, else the built-in row's, else no. A
-    /// custom slug fronts a backend only its author knows, so it has to opt
-    /// in: a wrong `false` costs one cache rewrite per load, a wrong `true`
-    /// is a 400 or a definition the gateway silently drops.
+    /// Needs both the endpoint and the model, see [`DeferralEndpoint`]. Every
+    /// unknown errs towards no: a wrong no costs one cache rewrite per load,
+    /// a wrong yes is a 400 or a definition the gateway silently drops.
+    /// Anthropic's endpoint serves models without tool search (before the 4.5
+    /// generation), so its table names the ones with it.
     pub fn supports_deferred_tools(&self) -> bool {
         let config = ProvidersConfig::load_or_default();
-        deferred_tools_support(&self.provider, config.get(&self.provider))
+        let def = config.get(&self.provider);
+        let configured_url = base_url_override(&self.provider).or_else(|| def?.base_url.clone());
+        let model = ProviderRegistry::for_slug(&self.provider)
+            .and_then(|spec| lookup_entry(spec.models(), &self.id)?.supports_deferred_tools);
+        match deferral_endpoint(&self.provider, def, configured_url.as_deref()) {
+            DeferralEndpoint::Unsupported => false,
+            DeferralEndpoint::Builtin => model == Some(true),
+            DeferralEndpoint::Declared => model != Some(false),
+        }
     }
 
     /// Discovery has not answered yet, so the `false` from [`Self::supports_fast`]
@@ -1589,22 +1636,44 @@ mod tests {
         assert_eq!(Model::from_spec(spec).unwrap().supports_vision(), expected);
     }
 
-    #[test_case("anthropic", None, true ; "anthropic_row_declares_it")]
-    #[test_case("openai", None, false ; "other_builtin")]
-    #[test_case("copilot", None, false ; "claude_behind_another_protocol")]
-    #[test_case("claude-gateway", None, false ; "custom_slug_must_opt_in")]
-    #[test_case("claude-gateway", Some(true), true ; "custom_slug_opted_in")]
-    #[test_case("anthropic", Some(false), false ; "providers_toml_outranks_the_builtin_row")]
-    fn deferred_tools_support_is_the_endpoints_declared_word(
+    #[test_case("anthropic", None, None, DeferralEndpoint::Builtin ; "anthropic_row_declares_it")]
+    #[test_case("anthropic", None, Some("https://api.anthropic.com/v1/messages"), DeferralEndpoint::Builtin ; "own_host_spelled_out")]
+    #[test_case("anthropic", None, Some("https://gateway.example.com"), DeferralEndpoint::Unsupported ; "rerouted_builtin_must_opt_in")]
+    #[test_case("anthropic", Some(true), Some("https://gateway.example.com"), DeferralEndpoint::Declared ; "rerouted_builtin_opted_in")]
+    #[test_case("openai", None, None, DeferralEndpoint::Unsupported ; "other_builtin")]
+    #[test_case("copilot", None, None, DeferralEndpoint::Unsupported ; "claude_behind_another_protocol")]
+    #[test_case("claude-gateway", None, None, DeferralEndpoint::Unsupported ; "custom_slug_must_opt_in")]
+    #[test_case("claude-gateway", Some(true), None, DeferralEndpoint::Declared ; "custom_slug_opted_in")]
+    #[test_case("anthropic", Some(false), None, DeferralEndpoint::Unsupported ; "providers_toml_outranks_the_builtin_row")]
+    fn deferral_endpoint_is_vouched_for(
         slug: &str,
         declared: Option<bool>,
-        expected: bool,
+        configured_url: Option<&str>,
+        expected: DeferralEndpoint,
     ) {
         let def = ProviderDef {
             supports_deferred_tools: declared,
             ..ProviderDef::default()
         };
-        assert_eq!(deferred_tools_support(slug, Some(&def)), expected);
+        assert_eq!(
+            deferral_endpoint(slug, Some(&def), configured_url),
+            expected
+        );
+    }
+
+    #[test_case("anthropic/claude-opus-5", true ; "current_model")]
+    #[test_case("anthropic/claude-haiku-4-5-20251001", true ; "haiku_4_5_snapshot")]
+    #[test_case("anthropic/claude-sonnet-4-5", true ; "longer_prefix_outranks_the_vetoed_row")]
+    #[test_case("anthropic/claude-sonnet-4-20250514", false ; "sonnet_4")]
+    #[test_case("anthropic/claude-opus-4-1", false ; "opus_4_1")]
+    #[test_case("anthropic/claude-opus-4-20250514", false ; "opus_4_0_snapshot")]
+    #[test_case("anthropic/claude-3-5-haiku-20241022", false ; "model_missing_from_the_table")]
+    #[test_case("openai/gpt-5", false ; "endpoint_without_support")]
+    fn deferred_tools_need_the_endpoint_and_the_model(spec: &str, expected: bool) {
+        assert_eq!(
+            Model::from_spec(spec).unwrap().supports_deferred_tools(),
+            expected
+        );
     }
 
     #[test_case("claude-opus-5",    true  ; "entry_with_fast_pricing")]

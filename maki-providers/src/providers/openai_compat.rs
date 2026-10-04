@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 
 use super::ResolvedAuth;
 use crate::model::ModelFamily;
+use crate::types::rejects_sampling;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
     ThinkingConfig, TokenUsage,
@@ -173,9 +174,11 @@ impl OpenAiCompatProvider {
         });
         // OpenAI's reasoning models reject `top_p` whenever reasoning effort
         // is set. Everyone else (deepseek, glm, grok, llama.cpp) takes it
-        // alongside thinking, so only the GPT family is gated.
+        // alongside thinking, so only the GPT family is gated. A gateway
+        // serving recent Claude passes the 400 through.
         if let Some(top_p) = top_p
             && !(thinking.is_enabled() && model.family == ModelFamily::Gpt)
+            && !rejects_sampling(&model.id)
         {
             body["top_p"] = json!(top_p);
         }
@@ -814,6 +817,7 @@ pub async fn parse_sse(
         },
         usage,
         stop_reason,
+        ..Default::default()
     })
 }
 
@@ -1481,17 +1485,23 @@ data: [DONE]\n";
         }
     }
 
-    #[test_case(ModelFamily::Gpt, ThinkingConfig::Off, true ; "gpt_off_sends")]
-    #[test_case(ModelFamily::Gpt, ThinkingConfig::Adaptive, false ; "gpt_thinking_omits")]
-    #[test_case(ModelFamily::Generic, ThinkingConfig::Adaptive, true ; "generic_thinking_sends")]
-    #[test_case(ModelFamily::Glm, ThinkingConfig::Effort(crate::Effort::High), true ; "glm_effort_sends")]
-    fn build_body_top_p_gated_on_gpt_reasoning(
+    #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Off, true ; "gpt_off_sends")]
+    #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Adaptive, false ; "gpt_thinking_omits")]
+    #[test_case("test-model", ModelFamily::Generic, ThinkingConfig::Adaptive, true ; "generic_thinking_sends")]
+    #[test_case("test-model", ModelFamily::Glm, ThinkingConfig::Effort(crate::Effort::High), true ; "glm_effort_sends")]
+    #[test_case("anthropic/claude-opus-4-7", ModelFamily::Generic, ThinkingConfig::Off, false ; "gateway_adaptive_only_claude_omits")]
+    fn build_body_top_p_gated(
+        model_id: &str,
         family: ModelFamily,
         thinking: ThinkingConfig,
         sent: bool,
     ) {
+        let model = Model {
+            id: model_id.into(),
+            ..test_model(family)
+        };
         let body = test_provider().build_body(
-            &test_model(family),
+            &model,
             &[Message::user("hi".into())],
             "",
             &json!([]),

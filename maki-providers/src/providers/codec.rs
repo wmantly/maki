@@ -9,7 +9,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 
-use maki_config::providers::Protocol;
+use maki_config::providers::{Protocol, ProvidersConfig, configured_base_url};
 use maki_storage::id::SessionRef;
 
 use super::openai::responses;
@@ -440,6 +440,7 @@ pub fn build(
     match options.protocol {
         Protocol::Anthropic => Box::new(
             super::anthropic::Anthropic::with_auth(auth, timeouts)
+                .with_fallback_base_url(fallback_base_url(&options))
                 .with_system_prefix(options.system_prefix),
         ),
         Protocol::Openai | Protocol::OpenaiResponses => Box::new(CompatProvider {
@@ -450,8 +451,19 @@ pub fn build(
             openai: options.openai,
             build_body: options.build_body,
         }),
-        Protocol::Google => Box::new(super::google::Google::with_auth(auth, timeouts)),
+        Protocol::Google => Box::new(
+            super::google::Google::with_auth(auth, timeouts)
+                .with_fallback_base_url(fallback_base_url(&options)),
+        ),
     }
+}
+
+/// The same order [`OpenAiCompatProvider::base_url`] keeps under a hook's
+/// origin, for the codecs that otherwise only know their vendor's host.
+fn fallback_base_url(options: &CodecOptions) -> Option<String> {
+    let config = ProvidersConfig::load();
+    configured_base_url(&options.slug, config.get(&options.slug))
+        .or_else(|| (!options.base_url.is_empty()).then(|| options.base_url.to_string()))
 }
 
 pub(crate) struct CompatProvider {

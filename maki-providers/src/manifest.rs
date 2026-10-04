@@ -23,10 +23,10 @@ struct ModelTable {
 }
 
 /// One curated row as the file spells it. Stricter than the plugin surface
-/// [`ModelEntry`] decodes: `max_output_tokens` is the only field allowed a
-/// serde default, because TOML has no null and an absent limit really does
-/// mean "the provider never published one". Everything else missing, or
-/// spelled wrong, is a mistake worth hearing about.
+/// [`ModelEntry`] decodes: only `max_output_tokens` and `deferred_tools` are
+/// allowed a serde default, because TOML has no null and absent really does
+/// mean "the provider never published one" or "the endpoint's word".
+/// Everything else missing, or spelled wrong, is a mistake worth hearing about.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CuratedRow {
@@ -39,6 +39,8 @@ struct CuratedRow {
     #[serde(default)]
     max_output_tokens: Option<u32>,
     context_window: u32,
+    #[serde(default)]
+    deferred_tools: Option<bool>,
 }
 
 impl From<CuratedRow> for ModelEntry {
@@ -52,6 +54,7 @@ impl From<CuratedRow> for ModelEntry {
             pricing: Some(row.pricing),
             max_output_tokens: row.max_output_tokens,
             context_window: Some(row.context_window),
+            supports_deferred_tools: row.deferred_tools,
             ..Self::default()
         }
     }

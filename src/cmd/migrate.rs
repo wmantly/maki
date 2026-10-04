@@ -12,7 +12,7 @@ use color_eyre::eyre::Context;
 use maki_storage::input_history::MAX_ENTRIES;
 use maki_storage::paths::{self, tilde};
 
-use crate::provider_scripts::{self, MIGRATE_COMMAND, Script};
+use crate::provider_scripts::{self, MIGRATE_COMMAND, Reference, Script};
 
 #[cfg(unix)]
 const AUTH_FILE_MODE: u32 = 0o600;
@@ -240,10 +240,14 @@ pub fn providers() -> Result<()> {
         eprintln!("{}", nothing_to_port(&dir));
         return Ok(());
     }
+    let reference = Reference::find();
     if io::stdout().is_terminal() {
-        eprint!("{}", providers_banner(&unported));
+        eprint!(
+            "{}",
+            providers_banner(&unported, reference.old_maki.as_deref())
+        );
     }
-    print!("{}", provider_scripts::prompt(&dir, &unported));
+    print!("{}", provider_scripts::prompt(&dir, &unported, &reference));
     Ok(())
 }
 
@@ -260,7 +264,7 @@ fn nothing_to_port(dir: &Path) -> String {
     )
 }
 
-fn providers_banner(scripts: &[Script]) -> String {
+fn providers_banner(scripts: &[Script], old_maki: Option<&Path>) -> String {
     let width = scripts.iter().map(|s| s.slug.len()).max().unwrap_or(0);
     let mut out =
         String::from("Maki no longer runs provider scripts. These need a Lua plugin:\n\n");
@@ -269,9 +273,20 @@ fn providers_banner(scripts: &[Script]) -> String {
     }
     out.push_str("\nThe prompt below asks a coding agent to port them for you.\n");
     if !cfg!(windows) {
+        let run = match old_maki {
+            Some(path) => {
+                let _ = write!(
+                    out,
+                    "\nRun it with your previous maki, which `maki update` kept and which still runs the scripts:\n\n  {} \"$({MIGRATE_COMMAND})\"\n",
+                    tilde(path)
+                );
+                "Or run"
+            }
+            None => "Run",
+        };
         let _ = write!(
             out,
-            "\nRun it in maki, with any model you have set up:\n\n  maki \"$({MIGRATE_COMMAND})\"\n"
+            "\n{run} it in maki, with any model you have set up:\n\n  maki \"$({MIGRATE_COMMAND})\"\n"
         );
     }
     let copy = if cfg!(windows) { "Copy" } else { "Or copy" };

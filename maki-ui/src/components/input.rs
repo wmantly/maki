@@ -270,8 +270,24 @@ impl InputBox {
         self.buffer.value().trim().is_empty() && self.pending_images.is_empty()
     }
 
-    pub fn swap_draft(&mut self, draft: Submission) -> Submission {
+    /// The text the user is composing. Under an untouched history recall that
+    /// is the draft it covers, since the recall is still in history. An edited
+    /// recall is new work and wins over the draft, as it does on submit.
+    pub fn draft_text(&self) -> String {
         let text = self.buffer.value();
+        let untouched_recall = self
+            .history_index
+            .and_then(|i| self.history.get(i))
+            .is_some_and(|entry| entry == text);
+        if untouched_recall {
+            self.draft.clone()
+        } else {
+            text
+        }
+    }
+
+    pub fn swap_draft(&mut self, draft: Submission) -> Submission {
+        let text = self.draft_text();
         let images = mem::take(&mut self.pending_images);
         self.discard();
         self.set_input(draft.text);
@@ -976,6 +992,31 @@ mod tests {
 
         input.history_down();
         assert_eq!(input.buffer.value(), "");
+    }
+
+    const DRAFT: &str = "draft";
+    const RECALLED: &str = "recalled";
+    const EDITED_RECALL: &str = "edited";
+
+    #[test_case(None, DRAFT ; "untouched_recall_keeps_the_draft")]
+    #[test_case(Some(EDITED_RECALL), EDITED_RECALL ; "edited_recall_keeps_the_edit")]
+    fn draft_while_browsing_history(edit: Option<&str>, parked: &str) {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, RECALLED);
+        type_text(&mut input, DRAFT);
+        input.history_up();
+        if let Some(edit) = edit {
+            input.buffer.clear();
+            type_text(&mut input, edit);
+        }
+        assert_eq!(input.draft_text(), parked);
+
+        let swapped = input.swap_draft(Submission {
+            text: String::new(),
+            images: Vec::new(),
+        });
+
+        assert_eq!(swapped.text, parked);
     }
 
     #[test]

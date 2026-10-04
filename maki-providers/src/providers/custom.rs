@@ -117,6 +117,7 @@ impl From<&ModelDef> for ModelEntry {
             supports_thinking: def.supports_thinking,
             requires_thinking: def.requires_thinking.unwrap_or(false),
             supports_vision: def.supports_vision,
+            supports_deferred_tools: None,
             max_output_tokens: def.max_output_tokens,
             context_window: def.context_window,
             pricing: def.has_pricing().then(|| ModelPricing {

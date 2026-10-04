@@ -33,6 +33,7 @@ use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
+use crate::components::alert_modal::AlertModal;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
@@ -58,7 +59,7 @@ use crate::components::{
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager, TaggedAnswer};
 use maki_agent::{
@@ -413,6 +414,7 @@ pub struct App {
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
+    pub(super) alert_modal: AlertModal,
     pub(super) help_modal: HelpModal,
     pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
@@ -452,7 +454,6 @@ pub struct App {
     pub(crate) trust_question: Option<TrustQuestion>,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedMessages>,
-    pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     pub(crate) primary_paste_rx: Vec<flume::Receiver<Option<String>>>,
     storage_writer: Arc<StorageWriter>,
@@ -548,6 +549,7 @@ impl App {
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
+            alert_modal: AlertModal::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
             btw_modal: BtwModal::new(typewriter, ui_config.show_thinking),
@@ -577,7 +579,6 @@ impl App {
             trust_question: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
-            btw_system: None,
             image_paste_rx: vec![],
             primary_paste_rx: vec![],
             storage_writer,
@@ -641,6 +642,16 @@ impl App {
         let draft = mem::take(&mut self.chats[idx].draft);
         self.chats[self.active_chat].draft = self.input_box.swap_draft(draft);
         self.active_chat = idx;
+    }
+
+    /// The session's draft is the main agent's, which the box only holds while
+    /// the main chat is in front.
+    pub(super) fn main_draft(&self) -> String {
+        if self.is_main_chat() {
+            self.input_box.draft_text()
+        } else {
+            self.chats[0].draft.text.clone()
+        }
     }
 
     fn plan_form_open(&self) -> bool {
@@ -1355,6 +1366,12 @@ impl App {
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        // Drawn above everything else, so it answers keys before anything else.
+        if self.alert_modal.is_open() {
+            self.alert_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
         // With both up the permission prompt goes first: a tool is blocked on
         // it and it owns the bottom panel. The pack review waits on nothing.
         if self.permission_prompt.is_open() {
@@ -2474,8 +2491,9 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    fn overlays(&self) -> [&dyn Overlay; 14] {
         [
+            &self.alert_modal,
             &self.help_modal,
             &self.usage_modal,
             &self.btw_modal,
@@ -2492,8 +2510,9 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
         [
+            &mut self.alert_modal,
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.btw_modal,

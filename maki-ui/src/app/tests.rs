@@ -6820,6 +6820,28 @@ fn draft_stays_with_the_chat_it_was_typed_in() {
     assert!(app.queue.is_empty());
 }
 
+/// The box holds whichever chat is in front, and the session saved the box,
+/// so the main draft went missing from it and a subagent's took its place.
+#[test]
+fn the_session_keeps_the_main_draft_while_a_subagent_chat_is_in_front() {
+    const MAIN_DRAFT: &str = "for main";
+    const SUB_DRAFT: &str = "for sub";
+    let (mut app, _inbox) = app_with_subagent_inbox();
+    app.run_builtin(BuiltinAction::PrevChat);
+    app.update(Msg::Paste(MAIN_DRAFT.into()));
+    app.run_builtin(BuiltinAction::NextChat);
+    app.update(Msg::Paste(SUB_DRAFT.into()));
+
+    app.checkpoint();
+    assert_eq!(
+        app.state.session.meta.input_draft.as_deref(),
+        Some(MAIN_DRAFT)
+    );
+
+    app.reset_ui_chrome();
+    assert_eq!(app.input_box.buffer.value(), MAIN_DRAFT);
+}
+
 #[test]
 fn ctrl_c_in_subagent_chat_discards_draft_before_cancelling() {
     let mut app = app_with_active_subagent();

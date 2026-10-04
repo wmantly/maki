@@ -334,7 +334,7 @@ pub struct ProviderDef {
     /// Whether the endpoint expands `tool_reference` blocks into
     /// `defer_loading` definitions, so a deferred MCP tool loads without
     /// rewriting the cached tools prefix. Unset falls back to the built-in
-    /// row, `false` for a custom slug.
+    /// row at its own URL, `false` for a custom slug or another `base_url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_deferred_tools: Option<bool>,
     /// Opencode-only: when `Some(false)`, free catalog models are hidden

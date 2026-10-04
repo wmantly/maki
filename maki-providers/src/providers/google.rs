@@ -118,6 +118,9 @@ pub struct Google {
     stream_timeout: Duration,
     /// Env / `providers.toml` / inventory default, resolved once at construction.
     resolved_base_url: Option<String>,
+    /// Where a codec caller sends requests when its auth carries no origin.
+    /// Kept out of the auth cell, because an origin there outranks the user's.
+    fallback_base_url: Option<String>,
 }
 
 impl Google {
@@ -131,6 +134,7 @@ impl Google {
             key_pool: Some(pool),
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            fallback_base_url: None,
         })
     }
 
@@ -145,7 +149,22 @@ impl Google {
             key_pool: None,
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            fallback_base_url: None,
         }
+    }
+
+    pub(crate) fn with_fallback_base_url(mut self, base_url: Option<String>) -> Self {
+        self.fallback_base_url = base_url;
+        self
+    }
+
+    fn base_url(&self) -> String {
+        let auth = self.auth.lock().unwrap();
+        auth.base_url
+            .as_deref()
+            .or(self.fallback_base_url.as_deref())
+            .unwrap_or(BASE_URL)
+            .to_string()
     }
 
     fn build_request(&self, method: &str, url: &str) -> isahc::http::request::Builder {
@@ -168,19 +187,13 @@ impl Google {
     }
 
     fn stream_url(&self, model_id: &str) -> String {
-        let base = {
-            let auth = self.auth.lock().unwrap();
-            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
-        };
+        let base = self.base_url();
         let encoded = super::urlenc(model_id);
         format!("{base}/models/{encoded}:streamGenerateContent?alt=sse")
     }
 
     fn models_url(&self) -> String {
-        let base = {
-            let auth = self.auth.lock().unwrap();
-            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
-        };
+        let base = self.base_url();
         let key = self.api_key();
         format!("{base}/models?key={key}&pageSize=1000")
     }
@@ -301,6 +314,11 @@ impl Provider for Google {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
+            // Credentials handed in through `with_auth` belong to the caller,
+            // and our vendor key must never follow them to a third-party origin.
+            if self.key_pool.is_none() {
+                return Ok(());
+            }
             let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
             *self.auth.lock().unwrap() =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
@@ -682,6 +700,7 @@ async fn parse_sse(
         },
         usage,
         stop_reason,
+        ..Default::default()
     })
 }
 

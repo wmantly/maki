@@ -31,6 +31,7 @@ const PROVIDERS_TOML_DOCS: &str = "https://maki.sh/docs/providers/";
 const CONFIGURED: &str = "\x1b[32m✓\x1b[0m";
 const FROM_ENV: &str = "\x1b[33m~\x1b[0m";
 const UNCONFIGURED: &str = " ";
+const PLAN_PREVIEW_PATH: &str = "plan.md";
 
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
@@ -710,7 +711,7 @@ pub fn prompt(
     trust_mode: TrustMode,
 ) -> Result<()> {
     use crate::cli::PromptVariant;
-    use maki_agent::agent::{build_system_prompt, load_instruction_text};
+    use maki_agent::agent::{build_system_prompt, load_instruction_text, plan_mode_update};
     use maki_agent::prompt::{PromptId, assemble};
     use maki_agent::template;
     use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
@@ -754,21 +755,30 @@ pub fn prompt(
 
     let output = match variant {
         PromptVariant::System => {
-            let mode = if plan {
-                maki_agent::AgentMode::Plan(std::path::PathBuf::from("plan.md"))
-            } else {
-                maki_agent::AgentMode::Build
-            };
             let model_spec = config
                 .provider
                 .default_model
                 .as_deref()
                 .unwrap_or("anthropic/claude-sonnet-4-20250514");
             let model = Model::from_spec(model_spec).context("invalid default model")?;
-            build_system_prompt(&vars, &mode, &instructions, &slots, &model)
+            let prompt = build_system_prompt(&vars, &instructions, &slots, &model);
+            // Plan mode reaches the model as a context update after the
+            // prompt, so this shows that message too.
+            if plan {
+                format!(
+                    "{prompt}\n\n{}",
+                    plan_mode_update(Path::new(PLAN_PREVIEW_PATH))
+                )
+            } else {
+                prompt
+            }
         }
-        PromptVariant::Research => assemble(PromptId::Research, &slots, &instructions),
-        PromptVariant::General => assemble(PromptId::General, &slots, &instructions),
+        PromptVariant::Research => vars
+            .apply(&assemble(PromptId::Research, &slots, &instructions))
+            .into_owned(),
+        PromptVariant::General => vars
+            .apply(&assemble(PromptId::General, &slots, &instructions))
+            .into_owned(),
     };
 
     print!("{output}");

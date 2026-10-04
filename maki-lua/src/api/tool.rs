@@ -973,6 +973,10 @@ async fn run_command(
 ///
 /// Throws if you pass a singleton slot name.
 ///
+/// A function `content` is called before every run. Its first value goes in
+/// the system prompt, and later changes reach the model as a context update
+/// until the next compaction.
+///
 /// @param spec table Hint specification:
 ///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "general").
 ///   content (string|function) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
@@ -1016,7 +1020,8 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
 /// makes more sense than combining fragments. For aggregate slots like
 /// "tool_usage", use `register_prompt_hint` instead.
 ///
-/// Throws if you pass an aggregate slot name.
+/// Throws if you pass an aggregate slot name. A function `content` behaves
+/// as in `register_prompt_hint`.
 ///
 /// @param spec table Spec fields mirror `register_prompt_hint`:
 ///   slot    (string)         Required. Singleton slot name (e.g. "identity", "tone").

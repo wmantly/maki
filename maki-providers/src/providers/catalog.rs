@@ -59,7 +59,7 @@ const CATALOG_URL: &str = "https://models.dev/api.json";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(86400);
 
-const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
+pub(crate) const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
 
 const IMAGE_MODALITY: &str = "image";
 
@@ -371,7 +371,7 @@ impl CatalogData {
                 continue;
             }
 
-            if !is_servable(&provider_id, &provider) {
+            if !is_servable(&provider_id, &provider.npm, provider.api.is_some()) {
                 continue;
             }
 
@@ -540,6 +540,23 @@ pub fn available_if_warm(slug: &str) -> bool {
     matches!(data.resolve_auth(&state_dir), Ok(Some(_)))
 }
 
+/// Whether maki serves `slug` from models.dev, which makes any key saved for
+/// it that provider's. Reads the warm catalog, else the disk cache at any age,
+/// and never fetches: a catalog maki never cached is one it never offered a
+/// login for.
+pub(crate) fn serves_slug(slug: &str) -> bool {
+    if let Some(Ok(catalog)) = SHARED_CATALOG.get().map(Mutex::lock) {
+        return catalog.providers.contains_key(slug);
+    }
+    let Some(text) = catalog_cache_path().and_then(|path| fs::read_to_string(path).ok()) else {
+        return false;
+    };
+    serde_json::from_str::<HashMap<String, schema::ProviderHead>>(&text)
+        .ok()
+        .and_then(|mut heads| heads.remove(slug))
+        .is_some_and(|head| is_servable(slug, &head.npm, head.api.is_some()))
+}
+
 fn catalog_cache_path() -> Option<PathBuf> {
     let dir = maki_storage::paths::cache_dir().ok()?;
     Some(dir.join(CATALOG_CACHE_FILE))
@@ -644,16 +661,16 @@ fn builtin_slug(catalog_id: &str) -> &str {
 /// Whether we could stream from this provider ourselves: one of the two
 /// protocols we speak, at a base URL the catalog publishes. Shipped providers
 /// never get here, they bring their own client and only need the metadata.
-fn is_servable(provider_id: &str, provider: &schema::CatalogProvider) -> bool {
-    if !ALLOWED_NPM.contains(&provider.npm.as_str()) {
-        debug!(provider = %provider_id, npm = %provider.npm, "skipping provider: unsupported npm package");
+fn is_servable(provider_id: &str, npm: &str, has_api: bool) -> bool {
+    if !ALLOWED_NPM.contains(&npm) {
+        debug!(provider = %provider_id, npm, "skipping provider: unsupported npm package");
         return false;
     }
     if BLOCKED_PROVIDER_IN_CATALOG.contains(&provider_id) {
         debug!(provider = %provider_id, "skipping provider: blocked");
         return false;
     }
-    if provider.api.is_none() {
+    if !has_api {
         debug!(provider = %provider_id, "skipping provider: no API URL in catalog");
         return false;
     }
@@ -2722,6 +2739,14 @@ pub(crate) mod schema {
     use serde::{Deserialize, Serialize};
 
     pub type CatalogIndex = HashMap<String, CatalogProvider>;
+
+    /// Enough of a [`CatalogProvider`] to tell whether maki serves it,
+    /// without building every model row.
+    #[derive(Deserialize)]
+    pub struct ProviderHead {
+        pub npm: String,
+        pub api: Option<String>,
+    }
 
     #[derive(Deserialize, Serialize)]
     pub struct CatalogProvider {
