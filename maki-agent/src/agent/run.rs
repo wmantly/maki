@@ -66,7 +66,7 @@ const MODEL_BINDING_MISMATCH: &str = "model_binding_mismatch";
 const THINKING_DROPPED: &str =
     "The prompt changed under earlier reasoning, so it was dropped to keep the session going.";
 
-pub fn resolve_compaction_model(
+pub async fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
     model: &Model,
     timeouts: maki_providers::Timeouts,
@@ -76,7 +76,7 @@ pub fn resolve_compaction_model(
         maki_providers::model_registry::spec_for_tier_any(maki_providers::ModelTier::Compaction)
         && model_policy.allows(&spec)
         && let Ok(mut m) = Model::from_spec(&spec)
-        && let Ok(p) = maki_providers::provider::from_model(&mut m, timeouts)
+        && let Ok(p) = maki_providers::provider::from_model_async(&mut m, timeouts).await
     {
         return (Arc::from(p), m);
     }
@@ -141,7 +141,7 @@ pub struct Agent<'h> {
     /// within a run, and not before every request.
     prompt_facts: Option<PromptFacts>,
     mode: AgentMode,
-    user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    user_response_rx: Option<Arc<smol::lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
     ledger: Arc<RunLedger>,
@@ -233,7 +233,7 @@ impl<'h> Agent<'h> {
 
     pub fn with_user_response_rx(
         mut self,
-        rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
+        rx: Arc<smol::lock::Mutex<flume::Receiver<String>>>,
     ) -> Self {
         self.user_response_rx = Some(rx);
         self
@@ -1002,7 +1002,8 @@ impl<'h> Agent<'h> {
             &self.model,
             self.timeouts,
             &self.model_policy,
-        );
+        )
+        .await;
         // Built from the fields, not `self.hooks()`, which would borrow all of
         // `self` while `history` is lent out mutably.
         let hooks = AgentHooks {
